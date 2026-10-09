@@ -136,7 +136,7 @@ The application expects `MainIcon.ico` and `Alternative Icons/` in the repositor
 
 ## Build on Windows
 
-Run `MediaExplorer\build_windows.bat` from a Windows checkout. It installs the Python dependencies and PyInstaller, then writes `MediaExplorer\dist\Magellan.exe`. Build output and thumbnail caches are intentionally excluded from Git; distribute executables through GitHub Releases rather than committing them to the source repository.
+Run `MediaExplorer\build_windows.bat` from a Windows checkout. It installs the Python dependencies and PyInstaller, then writes `MediaExplorer\dist\Magellan.exe`.
 
 ## Local settings and privacy
 
