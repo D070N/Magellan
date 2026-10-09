@@ -140,7 +140,7 @@ Run `MediaExplorer\build_windows.bat` from a Windows checkout. It installs the P
 
 ## Local settings and privacy
 
-Settings and logs are stored in the per-user application-data directory. The optional SauceNAO API key is stored in the local settings file and is not included in this repository. `Examples/` contains local sample images and is excluded; it is not needed to run the application.
+Settings and logs are stored in the per-user application-data directory. The optional SauceNAO API key is stored in the local settings file and is not included in this repository.
 
 ## License
 
