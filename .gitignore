@@ -1,0 +1,19 @@
+# Local samples and obsolete builds are not part of the application source.
+/Examples/
+/Legacy Versions/
+*.lnk
+
+# PyInstaller outputs, generated caches, and machine-specific artifacts.
+/MediaExplorer/build/
+/MediaExplorer/dist/
+/MediaExplorer/build_staging/
+/MediaExplorer/dist_staging/
+/MediaExplorer/build_log.txt
+/MediaExplorer/__pycache__/
+/MediaExplorer/thumbnail_cache/
+/MediaExplorer/logs/
+/MediaExplorer/settings.json
+__pycache__/
+*.py[cod]
+.venv/
+venv/
