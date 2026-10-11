@@ -1370,7 +1370,7 @@ class MediaCanvas(QWidget):
 
 class MediaViewer(QMainWindow):
     def __init__(self,paths,index=0,parent=None,slideshow_interval_ms=5000):
-        super().__init__(parent,Qt.Window);self.paths=list(paths);self.index=max(0,min(int(index),len(self.paths)-1)) if self.paths else -1;self.rotation=0;self.flip_h=False;self.flip_v=False;self.zoom=1.0;self.movie=None;self.full_image=QImage();self.static_pixmap=QPixmap();self.fit_pixmap=QPixmap();self.original_resolution=QSize();self.double_page=False;self.double_page_path=None;self.double_page_frame=QPixmap();self.loading=False;self.current_file_size=None;self.image_cache=OrderedDict();self.image_cache_bytes=0;self.image_cache_limit=256*1024*1024;self.cache_max_dimension=8000;self.cache_max_file_bytes=100*1024*1024;self.pending_image_paths=set();self.slideshow_active=False;self.slideshow_timer=QTimer(self);self.slideshow_timer.setInterval(max(250,int(slideshow_interval_ms)));self.slideshow_timer.timeout.connect(lambda:self.step(1));app=QApplication.instance();self.load_bridge=getattr(app,'_viewer_image_load_bridge',None)
+        super().__init__(parent,Qt.Window);self.paths=list(paths);self.index=max(0,min(int(index),len(self.paths)-1)) if self.paths else -1;self.rotation=0;self.flip_h=False;self.flip_v=False;self.zoom=1.0;self.movie=None;self.full_image=QImage();self.static_pixmap=QPixmap();self.fit_pixmap=QPixmap();self.original_resolution=QSize();self.double_page=False;self.double_page_path=None;self.double_page_frame=QPixmap();self.loading=False;self.current_file_size=None;self.image_cache=OrderedDict();self.image_cache_bytes=0;self.image_cache_limit=256*1024*1024;self.cache_max_dimension=8000;self.cache_max_file_bytes=100*1024*1024;self.pending_image_paths=set();self.image_load_futures={};self.pending_delete_path=None;self.slideshow_active=False;self.slideshow_timer=QTimer(self);self.slideshow_timer.setInterval(max(250,int(slideshow_interval_ms)));self.slideshow_timer.timeout.connect(lambda:self.step(1));app=QApplication.instance();self.load_bridge=getattr(app,'_viewer_image_load_bridge',None)
         if self.load_bridge is None:self.load_bridge=ViewerImageLoadBridge(app);app._viewer_image_load_bridge=self.load_bridge
         self.pointer_hide_timer=QTimer(self);self.pointer_hide_timer.setSingleShot(True);self.pointer_hide_timer.setInterval(1000);self.pointer_hide_timer.timeout.connect(self.hide_slideshow_cursor)
         self.load_bridge.loaded.connect(self.on_image_loaded);self.setWindowTitle('Magellan Viewer');self.canvas=MediaCanvas(self);self.canvas.setContentsMargins(0,0,0,0);self.setContentsMargins(0,0,0,0);self.setCentralWidget(self.canvas);self.setStyleSheet('QMainWindow{background:#080a10;border:0px}')
@@ -1398,8 +1398,17 @@ class MediaViewer(QMainWindow):
         count=len(self.paths)
         if not count or not 0<=self.index<count:return False
         return any(self.paths[(self.index+offset)%count]==path for offset in (-1,0,1))
+    def stop_movie(self):
+        movie=self.movie
+        if movie is None:return
+        self.movie=None;movie.stop()
+        # Detaching QMovie's device closes animated GIF/WebP files immediately.
+        movie.setDevice(None);movie.setFileName('');movie.deleteLater()
+    def release_current_image(self):
+        self.stop_movie();self.full_image=QImage();self.static_pixmap=QPixmap();self.fit_pixmap=QPixmap()
+        self.double_page_path=None;self.double_page_frame=QPixmap();self.canvas._render_cache=QPixmap();self.canvas._render_cache_key=None
     def load_current(self):
-        if self.movie:self.movie.stop();self.movie.deleteLater();self.movie=None
+        self.stop_movie()
         if not self.paths:
             self.index=-1;self.full_image=QImage();self.static_pixmap=QPixmap();self.fit_pixmap=QPixmap();self.original_resolution=QSize();self.current_file_size=None;self.loading=False;self.canvas.prepare_frame();return
         self.index=max(0,min(self.index,len(self.paths)-1))
@@ -1425,7 +1434,7 @@ class MediaViewer(QMainWindow):
         self.pending_image_paths.add(path);preview_size=QSize(self.canvas.size());
         if preview_size.width()<2 or preview_size.height()<2:
             screen=QApplication.primaryScreen();preview_size=screen.size() if screen else QSize(1920,1080)
-        future=VIEWER_IMAGE_POOL.submit(decode_viewer_image,path,preview_size,self.cache_max_dimension,self.cache_max_file_bytes,preload)
+        future=VIEWER_IMAGE_POOL.submit(decode_viewer_image,path,preview_size,self.cache_max_dimension,self.cache_max_file_bytes,preload);self.image_load_futures[path]=future
         def completed(result,p=path):
             try:data=result.result()
             except Exception:
@@ -1440,7 +1449,7 @@ class MediaViewer(QMainWindow):
             path=self.paths[(self.index+offset)%len(self.paths)]
             if path not in self.image_cache and path not in self.pending_image_paths and path!=self.paths[self.index]:self.request_image(path,preload=True)
     def on_image_loaded(self,path,image):
-        self.pending_image_paths.discard(path)
+        self.pending_image_paths.discard(path);self.image_load_futures.pop(path,None)
         if not self.paths:return
         cacheable=True;source_size=QSize()
         if isinstance(image,tuple):
@@ -1475,14 +1484,31 @@ class MediaViewer(QMainWindow):
         self.double_page=not self.double_page;self.fit_to_screen();self.canvas.update()
         if self.double_page and self.paths:self.request_image(self.paths[(self.index+1)%len(self.paths)],preload=True)
     def delete_current_to_trash(self):
-        if not self.paths:return
-        path=self.paths[self.index];parent=self.parent()
-        if parent is None or not parent.send_paths_to_trash([path]):return
-        self.image_cache.pop(path,None)
-        if len(self.paths)==1:self.paths=[];self.close();return
-        self.paths.pop(self.index)
-        if self.index>=len(self.paths):self.index=len(self.paths)-1
-        self.load_current()
+        if not self.paths or self.index<0:return
+        path=self.paths[self.index];future=self.image_load_futures.get(path)
+        if future is not None and not future.done():
+            if self.pending_delete_path==path:return
+            self.pending_delete_path=path;self.slideshow_timer.stop();QTimer.singleShot(40,lambda p=path:self.finish_pending_delete(p));return
+        self.delete_path_to_trash(path)
+    def finish_pending_delete(self,path):
+        if self.pending_delete_path!=path:return
+        future=self.image_load_futures.get(path)
+        if future is not None and not future.done():QTimer.singleShot(40,lambda p=path:self.finish_pending_delete(p));return
+        self.pending_delete_path=None;self.delete_path_to_trash(path)
+    def delete_path_to_trash(self,path):
+        if path not in self.paths:return
+        index=self.paths.index(path);was_current=index==self.index;parent=self.parent()
+        if was_current:self.release_current_image()
+        if parent is None or not parent.send_paths_to_trash([path]):
+            if was_current:self.load_current()
+            return
+        cached=self.image_cache.pop(path,None)
+        if cached is not None:self.image_cache_bytes=max(0,self.image_cache_bytes-self.cache_entry_bytes(cached))
+        self.double_page_path=None;self.double_page_frame=QPixmap();self.paths.pop(index)
+        if not self.paths:self.index=-1;self.close();return
+        if index<self.index:self.index-=1
+        elif index==self.index and self.index>=len(self.paths):self.index=len(self.paths)-1
+        if was_current:self.load_current()
     def toggle_slideshow(self):
         self.slideshow_active=not self.slideshow_active
         if self.slideshow_active:self.slideshow_timer.start();self.note_pointer_activity()
@@ -1514,8 +1540,7 @@ class MediaViewer(QMainWindow):
         if self.handle_viewer_key(e):e.accept();return
         super().keyPressEvent(e)
     def closeEvent(self,e):
-        self.slideshow_timer.stop();self.pointer_hide_timer.stop()
-        if self.movie:self.movie.stop()
+        self.slideshow_timer.stop();self.pointer_hide_timer.stop();self.stop_movie()
         parent=self.parent()
         if parent is not None and hasattr(parent,'viewer_closed'):parent.viewer_closed()
         super().closeEvent(e)
@@ -1699,8 +1724,12 @@ class Explorer(QMainWindow):
         if in_titlebar:
             self.main_hide_timer.stop()
             if not self.main_bar.isVisible():self.set_main_panel_visible(True)
-        elif self.main_bar.isVisible() and not self.root_widget.rect().contains(self.root_widget.mapFromGlobal(cursor)) and QApplication.focusWidget() is not self.search:
-            if not self.main_hide_timer.isActive():self.main_hide_timer.start(self.main_hide_delay)
+        elif self.main_bar.isVisible():
+            pos=self.root_widget.mapFromGlobal(cursor)
+            over_panel=self.main_bar.geometry().contains(pos) or (self.auto_hide_tabs and self.nav_bar.geometry().contains(pos))
+            over_menu=any(action.menu() and action.menu().isVisible() and action.menu().geometry().contains(cursor) for action in self.menu_bar.actions()) if hasattr(self,'menu_bar') else False
+            if over_panel or over_menu:self.main_hide_timer.stop()
+            elif not self.main_hide_timer.isActive():self.main_hide_timer.start(self.main_hide_delay)
     def hide_tree_overlay(self):
         if self.auto_hide_tree and hasattr(self,'tree_dock'):self.tree_dock.hide()
     def hide_main_panel(self):
@@ -1709,7 +1738,7 @@ class Explorer(QMainWindow):
             for action in self.menu_bar.actions():
                 menu=action.menu()
                 if menu and menu.isVisible():menu.close()
-        if self.auto_hide_main and hasattr(self,'main_bar') and QApplication.focusWidget() is not self.search:self.set_main_panel_visible(False)
+        if self.auto_hide_main and hasattr(self,'main_bar'):self.set_main_panel_visible(False)
     def set_main_panel_visible(self,visible):
         if not hasattr(self,'main_bar'):return
         if self.auto_hide_main:
@@ -1793,7 +1822,7 @@ class Explorer(QMainWindow):
                 elif self.main_bar.isVisible() and pos.y()>self.main_bar.height():self.main_hide_timer.start(self.main_hide_delay)
             if self.auto_hide_tree and hasattr(self,'tree_dock'):
                 if 0<=pos.x()<=10:
-                    self.tree_hide_timer.stop();self.tree_dock.setGeometry(self.root_widget.mapToGlobal(QPoint(0,0)).x(),self.root_widget.mapToGlobal(QPoint(0,0)).y(),300,self.root_widget.height());self.tree_dock.show();self.tree_dock.raise_()
+                    self.show_tree_overlay()
                 elif self.tree_dock.isVisible() and not QRect(0,0,300,self.root_widget.height()).contains(pos):self.tree_hide_timer.start(self.tree_hide_delay)
         if event.type()==QEvent.MouseMove and hasattr(self,'selection_clear_overlay') and not viewer_active:
             pos=self.root_widget.mapFromGlobal(QCursor.pos());self.position_right_controls()
@@ -1984,14 +2013,26 @@ class Explorer(QMainWindow):
         if active is not None and active is not self:return
         if not hasattr(self,'tree_dock'):
             self.build_file_tree()
-        self.tree_dock.setVisible(not self.tree_dock.isVisible())
-        if self.tree_dock.isVisible(): self.refresh_file_tree()
+        if self.tree_dock.isVisible():
+            self.tree_hide_timer.stop();self.tree_dock.hide()
+        elif self.auto_hide_tree:self.show_tree_overlay()
+        else:self.tree_dock.show()
+        if self.tree_dock.isVisible():self.refresh_file_tree()
+
+    def show_tree_overlay(self):
+        if not hasattr(self,'tree_dock'):return
+        origin=self.root_widget.mapToGlobal(QPoint(0,0))
+        self.tree_dock.setGeometry(origin.x(),origin.y(),300,self.root_widget.height())
+        self.tree_dock.show();self.tree_dock.raise_();self.tree_hide_timer.stop()
 
     def build_file_tree(self):
         self.tree_dock=QDockWidget('File Tree',self)
         self.tree_dock.setObjectName('fileTreeDock')
         self.tree_dock.setAllowedAreas(Qt.LeftDockWidgetArea)
         self.tree_dock.setFeatures(QDockWidget.DockWidgetClosable)
+        title=QWidget(self.tree_dock);title_row=QHBoxLayout(title);title_row.setContentsMargins(8,2,4,2);title_row.setSpacing(4)
+        title_label=QLabel('File Tree',title);title_label.setStyleSheet('color:#eee;font-weight:600;');title_row.addWidget(title_label);title_row.addStretch(1)
+        close_button=QToolButton(title);close_button.setObjectName('treeCloseButton');close_button.setText('×');close_button.setToolTip('Close file tree');close_button.setFixedSize(28,26);close_button.setStyleSheet('QToolButton#treeCloseButton{min-width:0;min-height:0;padding:0;}');close_button.clicked.connect(self.tree_dock.hide);title_row.addWidget(close_button);self.tree_dock.setTitleBarWidget(title)
         self.file_tree=QTreeWidget()
         self._tree_generation=0;self._tree_scan_active=set();self._tree_bridge=TreeScanBridge(self);self._tree_bridge.completed.connect(self.finish_tree_scan)
         self.file_tree.setHeaderHidden(True)
@@ -2430,7 +2471,7 @@ class Explorer(QMainWindow):
     def finish_tab_reveal(self):
         if not (self.auto_hide_main and self.auto_hide_tabs) or not self.main_bar.isVisible():return
         pos=self.root_widget.mapFromGlobal(QCursor.pos())
-        if self.main_bar.geometry().contains(pos) or self.nav_bar.geometry().contains(pos) or QApplication.focusWidget() is self.search:return
+        if self.main_bar.geometry().contains(pos) or self.nav_bar.geometry().contains(pos):return
         self.set_main_panel_visible(False)
 
     def create_farview(self):
