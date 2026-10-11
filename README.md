@@ -1,3 +1,7 @@
+# Suport the project
+
+Everything in here is completely free. There are no ads, monthly subscriptions, or paywalls! So if you feel generous and you like the app, you can [support via PayPal](https://www.paypal.com/donate/?business=LL62UHZCBYWS2&no_recurring=0&item_name=Thank+you+%28%24o%24%29&currency_code=BRL)
+
 # Magellan
 
 Magellan is a Windows desktop file and media browser built with Python and Qt. The application source and Windows build files are in [`MediaExplorer/`](MediaExplorer/); the root icon and `Alternative Icons/` assets are required by the app and its executable build.
