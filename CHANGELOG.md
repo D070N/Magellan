@@ -4,6 +4,10 @@
 
 - Improved folder-size sorting responsiveness by reusing cached sizes, prioritizing visible folders, and batching resorting until background size updates finish.
 - Prevented repeated thumbnail refreshes during size calculation, eliminating the tooltip blinking that occurred after scrolling stopped.
+- Reduced folder-heavy scrolling stalls by caching normalized pinned-thumbnail roots and using constant-time path checks.
+- Avoided full-grid scans and repaints for each asynchronous folder-size result by indexing items by path and invalidating only affected visible thumbnails.
+- Limited grid repainting to rows intersecting the invalidated area.
+- Kept tab context menus reachable in auto-hide mode, closed them when the pointer leaves, and restored Ctrl-based tab range selection.
 
 ## Unreleased — 2026-10-11
 
