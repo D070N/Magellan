@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased — 2026-10-12
+
+- Improved folder-size sorting responsiveness by reusing cached sizes, prioritizing visible folders, and batching resorting until background size updates finish.
+- Prevented repeated thumbnail refreshes during size calculation, eliminating the tooltip blinking that occurred after scrolling stopped.
+
 ## Unreleased — 2026-10-11
 
 - Kept favorite groups at the top of Favorites across sorting modes.
