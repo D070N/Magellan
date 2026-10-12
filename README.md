@@ -86,7 +86,7 @@ Visualization options:
 
 ## Controls:
 
-I've made the controls thinking about optimal navigation efficiency. So, you might need to get used to it, but I promise it will be worth it.
+I've made the controls thinking about optimal navigation efficiency. So, you might need to get used to it, but I promise it will be worth it. You can see all of them in the HELP menu.
 
 - Navigation:
 
