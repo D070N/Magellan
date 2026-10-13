@@ -20,7 +20,7 @@ If you are like me and always need to find more about a work of art or simply fi
 
 - Group image visualization system. "Farview" mode creates a continuous list of images and files for quick visualization. Now you won't have to suffer with hundreds of single-image folders like I once did, because Farview takes all of those pictures and files and lists them as if they were from the same folder:
 
-Before, the folders needed to be clicked, one by one, for you to reach a single or very few images, creating a touristic limbo of clicking:
+Before, the folders needed to be clicked, one by one, for you to reach a single or very few images, creating a tortuous limbo of clicking:
 <img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/b9ddd349-b6a1-4a89-bdfa-7a50961c635e" />
 
 After, each picture from each folder is listed and available for you with one click:
