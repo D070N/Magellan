@@ -20,15 +20,9 @@ If you are like me and always need to find more about a work of art or simply fi
 
 - Group image visualization system. "Farview" mode creates a continuous list of images and files for quick visualization. Now you won't have to suffer with hundreds of single-image folders like I once did, because Farview takes all of those pictures and files and lists them as if they were from the same folder:
 
-Before, the folders needed to be clicked, one by one, for you to reach a single or very few images, creating a tortuous limbo of clicking:
-<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/b9ddd349-b6a1-4a89-bdfa-7a50961c635e" />
+https://github.com/user-attachments/assets/d7a6019e-b3c0-4ef0-8169-747d85d465b0
 
-After, each picture from each folder is listed and available for you with one click:
-<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/683271b4-e93e-446e-85d4-4a4de858b95d" />
-
-Farview also enables you to create a list from a specific selection, and yes, we have a selection feature:
-
-<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/7aa0b6ab-0846-43b5-8624-99b933ed2e8d" />
+As you can see you can easely select your desired folders to create a Farview, or you can simply press the button directely to create a Farview of the entire local page. 
 
 - Now with the folders perfectly ordered, you can make use of our local image viewer to swipe the list you just created:
 
@@ -60,9 +54,13 @@ The favorites menu, accessible by pressing the Star button on the main panel, ha
 
 Here you can create favorite groups, use the organization mode to drag files and folders to specific groups, and access your usual selection buttons.
 
+- With the organization mode you can also set you own personal folder order and use it on Farview:
+
+https://github.com/user-attachments/assets/0b690a1b-efca-49df-a0c4-f26084e79414
+
 - Generate thumbnails asynchronously and cache them for smoother scrolling:
 
-<img width="292" height="188" alt="image" src="https://github.com/user-attachments/assets/a7266283-6f5f-4039-b5d6-4c35c873cb60" />
+<img width="279" height="263" alt="image" src="https://github.com/user-attachments/assets/a1151486-5f18-4126-ac31-54793e689113" />
 
 - Search the current folder, with optional recursive search under **Performance**.
 
@@ -78,15 +76,15 @@ Here you can create favorite groups, use the organization mode to drag files and
 
 - Useful tools:
 
-<img width="193" height="181" alt="image" src="https://github.com/user-attachments/assets/c14a746e-bb94-4896-b8a0-548071968586" />
+<img width="191" height="236" alt="image" src="https://github.com/user-attachments/assets/f32f30ab-42c9-4a76-9375-8491002976cd" />
 
 Visualization options:
 
-<img width="179" height="211" alt="image" src="https://github.com/user-attachments/assets/7c46bc0c-f160-481d-a061-54759029df76" />
+<img width="173" height="239" alt="image" src="https://github.com/user-attachments/assets/9f62748b-d4cf-4bbf-9f0c-00490ba12f28" />
 
 ## Controls:
 
-I've made the controls thinking about optimal navigation efficiency. So, you might need to get used to it, but I promise it will be worth it. You can see all of them in the HELP menu.
+I've made the controls thinking about optimal navigation efficiency. So, you might need to get used to it, but I promise it will be worth it. You can find all of them in the HELP menu along with their complete functionalities.
 
 - Navigation:
 
@@ -98,9 +96,11 @@ Middle Mouse-click: Opens the selected folder into a new tab and closes hovered 
 
 Shift+Left-click: Selection mode. Drag to define a selection area, and click to toggle the selection. 
 
-Alt+Left Click: Clears the current selection
+Alt+Left Click: Opens the containing folder of the targeted file.
 
-Ctrl+Left-click: Only used to toggle the selection.
+Ctrl+Left-click: Hold to enable organization mode.
+
+Ctrl+A: Selects and de-selects all files in the current page.
 
 Shift+Del: Sends selected files to trash.
 
@@ -118,6 +118,10 @@ Enter: Enters a folder.
 
 Arrows: Swipes controls. The "up" arrow closes the viewer.
 
+W, A, S, D: Repositions image when zooming.
+
+Q and W: Previous and Next image.
+
 R: Rotate image
 
 F: Flip image
@@ -125,7 +129,6 @@ F: Flip image
 H: Toggle slideshow.
 
 Del: Sends image to trash.
-
 
 ## Run from source
 
