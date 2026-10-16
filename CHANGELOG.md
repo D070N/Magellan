@@ -2,12 +2,20 @@
 
 ## Unreleased — 2026-10-15
 
+- Organization mode now works in regular folders, Farview, and Favorites.
+- Added the Personal order sorting button.
+- Added a managegement window for personal orders in the VIEW menu to review and exclude saved folder orders.
+- Ctrl+A and the right-side Select All button now select missing items, or deselect the current page when all its items are already selected.
+- Fixed the Refresh button behavior in Farviews and in the favorites menu.
+- Improved the looks of the "Keep thumbs" window.
 - Reduced smooth-scroll stalls by avoiding repeated thumbnail-card composition, painting only damaged cards, and deferring new thumbnail work until scroll motion settles; fixed cached placeholders so deferred folder thumbnails still load afterward. Smooth scrolling can still show some tearing on the user’s display.
 - Added a bounded cache for composed thumbnail cards that shares the configured memory budget with decoded thumbnails.
 - Improved Farview and personal ordering, including support for inheriting the source folder’s custom order.
 - Preserved file-tree expansion, selection, and scroll state more reliably, and added clearer progress and selection-size feedback for longer operations.
 - Added recursive-search, Lens text-query, tab scrolling/color, and thumbnail-cache location/size controls.
-- Removed temporary scroll-measurement logging from the repository version; diagnostics remain in the local testing source.
+- TOOLS > Scroll behavior now lets you set rows per wheel notch and toggle smooth momentum. (Smooth scrolling is still experimental)
+- Updated HELP to match the new commands and behavior.
+- Many minor fixes.
 
 ## Unreleased — 2026-10-12
 
