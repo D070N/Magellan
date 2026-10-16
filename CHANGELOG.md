@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — 2026-10-15
+
+- Reduced smooth-scroll stalls by avoiding repeated thumbnail-card composition, painting only damaged cards, and deferring new thumbnail work until scroll motion settles; fixed cached placeholders so deferred folder thumbnails still load afterward. Smooth scrolling can still show some tearing on the user’s display.
+- Added a bounded cache for composed thumbnail cards that shares the configured memory budget with decoded thumbnails.
+- Improved Farview and personal ordering, including support for inheriting the source folder’s custom order.
+- Preserved file-tree expansion, selection, and scroll state more reliably, and added clearer progress and selection-size feedback for longer operations.
+- Added recursive-search, Lens text-query, tab scrolling/color, and thumbnail-cache location/size controls.
+- Removed temporary scroll-measurement logging from the repository version; diagnostics remain in the local testing source.
+
 ## Unreleased — 2026-10-12
 
 - Improved folder-size sorting responsiveness by reusing cached sizes, prioritizing visible folders, and batching resorting until background size updates finish.

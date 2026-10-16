@@ -1,4 +1,4 @@
-import os, sys, json, subprocess, threading, hashlib, re, random, tempfile, base64, time, ctypes, copy, shutil, struct, logging, atexit
+import os, sys, json, subprocess, threading, hashlib, re, random, tempfile, base64, time, ctypes, copy, shutil, struct, logging, atexit, math
 from logging.handlers import RotatingFileHandler
 from ctypes import wintypes
 from pathlib import Path
@@ -25,15 +25,15 @@ try:
 except Exception:
     imageio_ffmpeg=None
 
-from PySide6.QtCore import Qt, QSize, QRect, QRectF, QPoint, QPointF, Signal, QObject, QThread, QStandardPaths, QTimer, QDir, QEvent, QMimeData, QEventLoop
+from PySide6.QtCore import Qt, QSize, QSizeF, QRect, QRectF, QPoint, QPointF, Signal, QObject, QThread, QStandardPaths, QTimer, QDir, QEvent, QMimeData, QEventLoop, QLockFile
 from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QFontMetricsF, QCursor, QImage, QImageReader, QIcon, QMovie, QDrag
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QAbstractScrollArea,
     QToolButton, QLabel, QFrame, QSlider, QMenu, QMenuBar, QFileDialog,
     QMessageBox, QInputDialog, QDialog, QDialogButtonBox, QListWidget,
-    QTabBar, QTreeWidget, QTreeWidgetItem, QDockWidget, QCheckBox, QSpinBox, QComboBox, QScrollArea,
-    QWidgetAction, QGridLayout, QPushButton
+    QTabBar, QTreeWidget, QTreeWidgetItem, QListWidgetItem, QDockWidget, QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox, QScrollArea, QAbstractItemView,
+    QWidgetAction, QGridLayout, QPushButton, QScroller, QScrollerProperties
 )
 
 # Large JPEGs can need a little headroom for decoder scratch buffers even when
@@ -101,9 +101,11 @@ def configure_logging(directory, max_storage_mib=8):
         log_path=directory/'magellan.log'
         for old_log in (log_path,Path(str(log_path)+'.1')):
             if old_log.exists() and old_log.stat().st_size>handler_limit:
-                tail=old_log.read_bytes()[-handler_limit:]
-                newline=tail.find(b'\n')
-                old_log.write_bytes(tail[newline+1:] if newline>=0 else tail)
+                with old_log.open('rb') as stream:
+                    stream.seek(-handler_limit,os.SEEK_END);tail=stream.read(handler_limit)
+                newline=tail.find(b'\n');trimmed=tail[newline+1:] if newline>=0 else tail
+                temporary=old_log.with_name(old_log.name+'.trim')
+                temporary.write_bytes(trimmed);os.replace(temporary,old_log)
         for handler in list(logger.handlers):
             if isinstance(handler,RotatingFileHandler):
                 logger.removeHandler(handler);handler.close()
@@ -127,6 +129,12 @@ def natural_key(value):
         else: converted.append((1,part))
     return (lead, tuple(converted))
 
+def javascript_literal(value):
+    """Serialize a value for an inline script without permitting a script break-out."""
+    return (json.dumps(value,ensure_ascii=True)
+            .replace('<',r'\u003c').replace('>',r'\u003e').replace('&',r'\u0026')
+            .replace('\u2028',r'\u2028').replace('\u2029',r'\u2029'))
+
 
 VIEWER_IMAGE_POOL=ThreadPoolExecutor(max_workers=3,thread_name_prefix='viewer-image')
 
@@ -144,6 +152,9 @@ def load_pdf_document(path,timeout_ms=10000):
 
 class ViewerImageLoadBridge(QObject):
     loaded=Signal(str,object)
+
+class FolderThumbnailBridge(QObject):
+    completed=Signal(str,object)
 
 def decode_viewer_image(path,preview_size,max_dimension=8000,max_file_bytes=100*1024*1024,preload=False):
     suffix=Path(path).suffix.casefold()
@@ -234,11 +245,11 @@ def birth(p):
         if hasattr(s,'st_birthtime'):return s.st_birthtime
         if sys.platform.startswith('win'):return s.st_ctime
         return s.st_ctime
-    except:return 0
+    except (OSError,ValueError,OverflowError):return 0
 
 def datefmt(t):
     try:return datetime.fromtimestamp(t).strftime('%d/%m/%Y %H:%M')
-    except:return '—'
+    except (OSError,ValueError,OverflowError):return '—'
 
 def sizefmt(n):
     if n<1024:return f'{n} B'
@@ -249,34 +260,65 @@ def sizefmt(n):
 
 class ScanSignals(QObject): done=Signal(list,str,int)
 class ScanTask(QThread):
-    def __init__(self,folder,recursive=False,generation=0,selection=None):super().__init__();self.folder=Path(folder);self.recursive=recursive;self.generation=generation;self.selection=list(selection or []);self.signals=ScanSignals()
+    def __init__(self,folder,recursive=False,generation=0,selection=None,manual_orders=None,manual_sort_settings=None):super().__init__();self.folder=Path(folder);self.recursive=recursive;self.generation=generation;self.selection=list(selection or []);self.manual_orders=manual_orders or {};self.manual_sort_settings=manual_sort_settings or {};self.signals=ScanSignals()
+    def order_names(self,parent,names):
+        try:
+            parent_key=os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(parent))))
+            if self.manual_sort_settings.get(parent_key,{}).get('sort')!='manual':return sorted(names,key=natural_key)
+            order=self.manual_orders.get('folder:'+parent_key,[]);ranks={path:rank for rank,path in enumerate(order)}
+            return sorted(names,key=lambda name:(ranks.get(os.path.normcase(os.path.normpath(os.path.abspath(os.path.join(os.fspath(parent),name)))),len(ranks)),natural_key(name)))
+        except (OSError,TypeError,ValueError):return sorted(names,key=natural_key)
     def run(self):
         out=[]
         try:
             if self.recursive:
                 roots=[Path(p) for p in self.selection] if self.selection else [self.folder]
-                seen=set()
+                seen=set();seen_dirs=set()
+                def add_media(path):
+                    if path.suffix.casefold() not in PREVIEW_EXTS:return
+                    path_key=os.path.normcase(os.path.abspath(str(path)))
+                    if path_key in seen:return
+                    seen.add(path_key)
+                    try:
+                        st=path.stat(follow_symlinks=False)
+                        out.append({'path':path,'name':path.name,'is_dir':False,'kind':kind(path),'mtime':st.st_mtime,'ctime':birth(path),'size':st.st_size,'parent':str(path.parent)})
+                    except OSError:pass
                 for selected_root in roots:
                     if self.isInterruptionRequested():return
                     if selected_root.is_file():
-                        candidates=[(selected_root.parent,[selected_root.name])]
-                    elif selected_root.is_dir():
-                        candidates=os.walk(selected_root,followlinks=False)
-                    else:continue
-                    for root,dirs,files in candidates:
+                        add_media(selected_root);continue
+                    if not selected_root.is_dir():continue
+                    pending=[selected_root]
+                    while pending:
                         if self.isInterruptionRequested():return
-                        dirs[:]=sorted((d for d in dirs if not d.startswith('.') or d.startswith('. ')),key=natural_key)
-                        for name in sorted(files,key=natural_key):
-                            if self.isInterruptionRequested():return
-                            p=Path(root)/name
-                            if p.suffix.casefold() not in PREVIEW_EXTS:continue
-                            path_key=os.path.normcase(os.path.abspath(str(p)))
-                            if path_key in seen:continue
-                            seen.add(path_key)
-                            try:
-                                st=p.stat(follow_symlinks=False)
-                                out.append({'path':p,'name':p.name,'is_dir':False,'kind':kind(p),'mtime':st.st_mtime,'ctime':birth(p),'size':st.st_size,'parent':str(p.parent)})
-                            except OSError:pass
+                        folder=pending.pop()
+                        folder_key=os.path.normcase(os.path.normpath(os.path.abspath(str(folder))))
+                        if folder_key in seen_dirs:continue
+                        seen_dirs.add(folder_key)
+                        try:
+                            with os.scandir(folder) as entries:
+                                directories=[];files=[]
+                                for entry in entries:
+                                    if self.isInterruptionRequested():return
+                                    if entry.is_dir(follow_symlinks=False):
+                                        if not entry.name.startswith('.') or entry.name.startswith('. '):directories.append(entry.name)
+                                    elif entry.is_file(follow_symlinks=False):files.append(entry.name)
+                        except OSError as error:
+                            logger.warning('Farview could not read %s: %s',folder,error);continue
+                        if self.manual_sort_settings.get(folder_key,{}).get('sort')=='manual':
+                            entries=self.order_names(folder,[*directories,*files])
+                            for name in reversed(entries):
+                                path=folder/name
+                                if name in directories:pending.append(path)
+                                else:
+                                    if path.suffix.casefold() in PREVIEW_EXTS:
+                                        # Stack file markers preserve mixed folder/file order.
+                                        pending.append(('file',path))
+                        else:
+                            for name in self.order_names(folder,files):add_media(folder/name)
+                            for name in reversed(self.order_names(folder,directories)):pending.append(folder/name)
+                        while pending and isinstance(pending[-1],tuple):
+                            _,file_path=pending.pop();add_media(file_path)
                 self.signals.done.emit(out,'',self.generation);return
             with os.scandir(self.folder) as it:
                 for e in it:
@@ -346,23 +388,71 @@ class MarqueeLabel(QLabel):
     def paintEvent(self,event):
         p=QPainter(self);p.setClipRect(self.rect());p.setPen(self.palette().color(self.foregroundRole()));text_y=(self.height()+QFontMetricsF(self.font()).height())/2-QFontMetricsF(self.font()).descent();p.drawText(QPointF(-self._offset,text_y),self.text())
 
+class ActivityOverlay(QWidget):
+    """Compact selection and long-operation feedback, painted without child churn."""
+    def __init__(self,parent):
+        super().__init__(parent);self.selection_text='';self.operation_text='';self.spinner_phase=0
+        self.setAttribute(Qt.WA_TransparentForMouseEvents,True);self.setAttribute(Qt.WA_TranslucentBackground,True)
+        self._timer=QTimer(self);self._timer.setInterval(80);self._timer.timeout.connect(self._animate)
+        self.hide()
+    def _animate(self):
+        self.spinner_phase=(self.spinner_phase+1)%12;self.update()
+    def set_selection(self,text):
+        self.selection_text=text or '';self._sync()
+    def set_operation(self,text):
+        self.operation_text=text or ''
+        if self.operation_text:self._timer.start()
+        else:self._timer.stop()
+        self._sync()
+    def _sync(self):
+        visible=bool(self.selection_text or self.operation_text)
+        self.setVisible(visible)
+        if visible:self.adjustSize();self.update()
+    def sizeHint(self):
+        fm=QFontMetricsF(self.font());lines=[t for t in (self.operation_text,self.selection_text) if t]
+        width=max((fm.horizontalAdvance(t) for t in lines),default=0)+52
+        return QSize(max(210,min(460,int(width))),max(42,16+len(lines)*22))
+    def paintEvent(self,event):
+        p=QPainter(self);p.setRenderHint(QPainter.Antialiasing);p.setPen(QPen(QColor(255,255,255,45),1));p.setBrush(QColor(12,14,19,205));p.drawRoundedRect(self.rect().adjusted(0,0,-1,-1),8,8)
+        y=18
+        if self.operation_text:
+            center=QPointF(17,y-5);p.setPen(QPen(QColor('#d0a32d'),2))
+            for i in range(8):
+                alpha=45+int(210*((i-self.spinner_phase)%8)/7);p.setPen(QPen(QColor(235,190,65,alpha),2));angle=i*math.pi/4
+                p.drawLine(QPointF(center.x()+math.cos(angle)*4,center.y()+math.sin(angle)*4),QPointF(center.x()+math.cos(angle)*8,center.y()+math.sin(angle)*8))
+            p.setPen(QColor('#eeeeee'));p.drawText(32,y,self.operation_text);y+=22
+        if self.selection_text:
+            p.setPen(QColor('#eeeeee'));p.drawText(12,y,self.selection_text)
+        p.end()
+
 class VirtualGrid(QAbstractScrollArea):
     openItem=Signal(str); middleOpenItem=Signal(str); goBack=Signal(); setThumb=Signal(str); context=Signal(str); imageSearchRequested=Signal(str); toggleItemFavorite=Signal(str)
     def __init__(self,parent=None):
-        super().__init__(parent);self._explorer_window=parent.window() if parent is not None else None;self._closing=False;self.items=[];self.items_by_path={};self._thumb_cache_roots_cache=None;self._thumb_cache_roots_generation=None;self.thumb=230;self.columns=5;self.mode='vertical';self.cache=OrderedDict();self.cache_bytes=0;self.cache_limit_bytes=256*1024*1024;self._visible_cache_keys=None;self.thumb_futures={};self.folder_cache={};self.folder_custom={};self.folder_futures={};self.folder_last_visible={};self.pool=ThreadPoolExecutor(max_workers=4);self.folder_pool=ThreadPoolExecutor(max_workers=2);self.size_pool=ThreadPoolExecutor(max_workers=1);self.hover_size_pool=ThreadPoolExecutor(max_workers=1);self.folder_size_cache={};self.folder_size_cache_checked_at={};self.folder_size_futures={};self.hover_folder_size_futures={};self.folder_size_queue=deque();self.folder_size_queued=set();self.hover_favorite_rect=QRect();self.hover_overlay_rect=QRect();self.hover_tooltip_rect=QRect();self.persistent_folder_cache_dir=None;self.last_scroll_value=0;self.last_scroll_time=0;self.fast_scroll=False;self.search_hover=-1;self.hover_index=-1;self.hover_animation_started=0;self.drag_source_index=-1;self.drag_started=False;self.drag_start=QPoint();self.last_favorite_drag=0.0;self.pending_favorite_item=-1;self.suppress_favorite_release=False;self.pending_group_rename_id=None;self.favorite_picker_delay=QTimer(self);self.favorite_picker_delay.setSingleShot(True);self.favorite_picker_delay.setInterval(120);self.favorite_picker_delay.timeout.connect(self.open_hover_favorite_picker);self.favorite_picker_key=None;self.favorite_picker_hover_key=None;self.favorite_click_timer=QTimer(self);self.favorite_click_timer.setSingleShot(True);self.favorite_click_timer.setInterval(220);self.favorite_click_timer.timeout.connect(self.dispatch_favorite_open);self.group_rename_timer=QTimer(self);self.group_rename_timer.setSingleShot(True);self.group_rename_timer.timeout.connect(self.dispatch_group_rename);self.setAcceptDrops(True);self.viewport().setAcceptDrops(True);self.setFrameShape(QFrame.NoFrame);self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);self.viewport().setMouseTracking(True);self.viewport().installEventFilter(self);self.image_search_active=False
+        super().__init__(parent);self._explorer_window=parent.window() if parent is not None else None;self._closing=False;self.items=[];self.items_by_path={};self._thumb_cache_roots_cache=None;self._thumb_cache_roots_generation=None;self.thumb=230;self.columns=5;self.mode='vertical';self.cache=OrderedDict();self.cache_bytes=0;self.cache_limit_bytes=256*1024*1024;self._visible_cache_keys=None;self.thumb_futures={};self.folder_cache={};self.folder_custom={};self.folder_futures={};self.folder_last_visible={};self.pool=ThreadPoolExecutor(max_workers=4);self.folder_pool=ThreadPoolExecutor(max_workers=2);self.size_pool=ThreadPoolExecutor(max_workers=1);self.hover_size_pool=ThreadPoolExecutor(max_workers=1);self.folder_size_cache={};self.folder_size_cache_checked_at={};self.folder_size_futures={};self.hover_folder_size_futures={};self.folder_size_events={};self.hover_folder_size_events={};self.folder_size_queue=deque();self.folder_size_queued=set();self.hover_favorite_rect=QRect();self.hover_overlay_rect=QRect();self.hover_tooltip_rect=QRect();self.persistent_folder_cache_dir=None;self.last_scroll_value=0;self.last_scroll_time=0;self.fast_scroll=False;self.search_hover=-1;self.hover_index=-1;self.hover_animation_started=0;self.drag_source_index=-1;self.drag_started=False;self.drag_start=QPoint();self.drop_indicator=None;self.last_favorite_drag=0.0;self.pending_favorite_item=-1;self.suppress_favorite_release=False;self.pending_group_rename_id=None;self.favorite_picker_delay=QTimer(self);self.favorite_picker_delay.setSingleShot(True);self.favorite_picker_delay.setInterval(120);self.favorite_picker_delay.timeout.connect(self.open_hover_favorite_picker);self.favorite_picker_key=None;self.favorite_picker_hover_key=None;self.favorite_click_timer=QTimer(self);self.favorite_click_timer.setSingleShot(True);self.favorite_click_timer.setInterval(220);self.favorite_click_timer.timeout.connect(self.dispatch_favorite_open);self.group_rename_timer=QTimer(self);self.group_rename_timer.setSingleShot(True);self.group_rename_timer.timeout.connect(self.dispatch_group_rename);self.setAcceptDrops(True);self.viewport().setAcceptDrops(True);self.setFrameShape(QFrame.NoFrame);self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff);self.viewport().setMouseTracking(True);self.viewport().installEventFilter(self);self.image_search_active=False
         icon_dir=getattr(parent,'icon_dir',None);image_icon=Path(icon_dir)/'image.png' if icon_dir else None;self.image_name_icon=QPixmap(str(image_icon)) if image_icon and image_icon.is_file() else QPixmap()
-        self.selected_paths=set();self.selection_undo=[];self.selection_dragging=False;self.selection_drag_moved=False;self.selection_anchor=None;self.selection_current=None;self.selection_base=set();self.last_mouse_pos=QPoint();self.navigation_index=-1;self.navigation_key=None;self.navigation_started=0.0
-        self.selection_scroll_timer=QTimer(self);self.selection_scroll_timer.setInterval(16);self.selection_scroll_timer.timeout.connect(self.auto_scroll_selection)
+        # Reuse immutable drawing resources; rebuilding QFont/QPen objects for
+        # every card on every scroll repaint adds avoidable GUI-thread work.
+        self.paint_fonts={
+            'label':QFont('Segoe UI',11),'horizontal_label':QFont('Segoe UI',12),
+            'horizontal_detail':QFont('Segoe UI',10),'center':QFont('Segoe UI',48),
+            'horizontal_center':QFont('Segoe UI',32),'group':QFont('Segoe UI Symbol',11,QFont.Bold),
+        }
+        self.paint_metadata={}
+        self.card_cache=OrderedDict();self.card_cache_bytes=0;self.card_cache_limit_bytes=64*1024*1024
+        self.selected_paths=set();self.selected_metadata={};self.selection_undo=[];self.selection_dragging=False;self.selection_drag_moved=False;self.selection_anchor=None;self.selection_current=None;self.selection_base=set();self.last_mouse_pos=QPoint();self.navigation_index=-1;self.navigation_key=None;self.navigation_started=0.0
+        self.selection_scroll_accumulator=0.0;self.selection_scroll_timer=QTimer(self);self.selection_scroll_timer.setInterval(16);self.selection_scroll_timer.timeout.connect(self.auto_scroll_selection)
+        self.wheel_scroller=QScroller.scroller(self);wheel_properties=self.wheel_scroller.scrollerProperties();wheel_properties.setScrollMetric(QScrollerProperties.FrameRate,QScrollerProperties.Standard);wheel_properties.setScrollMetric(QScrollerProperties.VerticalOvershootPolicy,QScrollerProperties.OvershootAlwaysOff);self.wheel_scroller.setScrollerProperties(wheel_properties)
         self.thumb_timer=QTimer(self);self.thumb_timer.timeout.connect(self.poll_async);self.thumb_timer.start(60)
         self.scroll_settle_timer=QTimer(self);self.scroll_settle_timer.setSingleShot(True);self.scroll_settle_timer.timeout.connect(self.scroll_settled)
         self.hover_delay_timer=QTimer(self);self.hover_delay_timer.setSingleShot(True);self.hover_delay_timer.timeout.connect(self.begin_hover_animation)
         self.hover_animation_timer=QTimer(self);self.hover_animation_timer.setInterval(16);self.hover_animation_timer.timeout.connect(self.advance_hover_animation)
-        self.setFocusPolicy(Qt.StrongFocus);self.verticalScrollBar().valueChanged.connect(self.on_scroll)
+        self.setFocusPolicy(Qt.StrongFocus);self.viewport().setAttribute(Qt.WA_OpaquePaintEvent,True);self.verticalScrollBar().valueChanged.connect(self.on_scroll)
     def explorer(self):
         """Return the top-level Explorer window, not the grid host widget."""
         return self._explorer_window or self.window()
 
     def setItems(self,items,reset_scroll=True):
+        if hasattr(self,'wheel_scroller'):self.wheel_scroller.stop()
         self.set_hover_index(-1)
         self.navigation_index=-1
         # Navigating to a new view should never leave old folder-discovery jobs ahead of the new viewport.
@@ -370,15 +460,27 @@ class VirtualGrid(QAbstractScrollArea):
             try: f.cancel()
             except: pass
         self.folder_futures.clear()
-        self.items=items;items_by_path={}
+        self.clear_card_cache();self.items=items;items_by_path={};paint_metadata={}
         for item in items:
             path=item.get('path')
             if path:items_by_path.setdefault(str(path),[]).append(item)
-        self.items_by_path=items_by_path;self.recalc()
+            item_kind=item.get('kind','file');suffix=Path(str(path or '')).suffix.casefold()
+            if item.get('is_dir') or item_kind=='favorite_group':prefix=''
+            elif item_kind=='video' or suffix=='.gif':prefix='▶  '
+            elif item_kind=='image':prefix='' if not self.image_name_icon.isNull() else '▧  '
+            elif item_kind=='audio':prefix='♫  '
+            else:prefix='▤  '
+            paint_metadata[id(item)]=(suffix,prefix,item_kind=='image' and suffix!='.gif' and not self.image_name_icon.isNull())
+        self.items_by_path=items_by_path;self.paint_metadata=paint_metadata;self.recalc()
         # A new folder/view always begins at the top; the Explorer restores a
         # saved position explicitly after the scan has finished.
         if reset_scroll:self.verticalScrollBar().setValue(0)
-    def setFolderThumbs(self,custom):self.folder_custom=custom or {};self.viewport().update()
+    def clear_card_cache(self):
+        self.card_cache.clear();self.card_cache_bytes=0
+    def trim_card_cache(self):
+        while self.card_cache and self.card_cache_bytes>self.card_cache_limit_bytes:
+            _,oldest=self.card_cache.popitem(last=False);self.card_cache_bytes=max(0,self.card_cache_bytes-self.pixmap_bytes(oldest))
+    def setFolderThumbs(self,custom):self.folder_custom=custom or {};self.clear_card_cache();self.viewport().update()
     def set_hover_settings(self,enabled,delay):
         self.hover_delay_timer.stop();self.hover_animation_timer.stop();self.hover_index=-1;self.hover_animation_started=0
         self.explorer().hover_details_enabled=bool(enabled);self.explorer().hover_details_delay=max(0,int(delay));self.viewport().update()
@@ -414,12 +516,17 @@ class VirtualGrid(QAbstractScrollArea):
             if key not in self.folder_size_queued:continue
             self.folder_size_queued.discard(key)
             if key in self.folder_size_futures or key in self.hover_folder_size_futures or not self.folder_size_needs_refresh(key):continue
-            self.folder_size_futures[key]=self.size_pool.submit(self.folder_size_worker,key)
+            self._submit_folder_size(self.folder_size_futures,self.folder_size_events,self.size_pool,key)
             return
+    def _submit_folder_size(self,futures,events,executor,key):
+        cancel_event=threading.Event();future=executor.submit(self.folder_size_worker,key,cancel_event)
+        futures[key]=future;events[key]=cancel_event
     def clear_folder_size_queue(self):
         self.folder_size_queue.clear();self.folder_size_queued.clear()
         for key,future in list(self.folder_size_futures.items()):
-            if not future.running() and future.cancel():self.folder_size_futures.pop(key,None)
+            event=self.folder_size_events.get(key)
+            if event:event.set()
+            if not future.running() and future.cancel():self.folder_size_futures.pop(key,None);self.folder_size_events.pop(key,None)
     def request_folder_size(self,item,priority=False):
         if self._closing:return
         key=str(item['path'])
@@ -431,19 +538,22 @@ class VirtualGrid(QAbstractScrollArea):
             self.folder_size_queued.discard(key)
             # A hovered item should not wait behind the size-sort backlog.
             queued=self.folder_size_futures.get(key)
-            if queued is not None and queued.cancel():self.folder_size_futures.pop(key,None)
-            self.hover_folder_size_futures[key]=self.hover_size_pool.submit(self.folder_size_worker,key)
+            if queued is not None:
+                event=self.folder_size_events.get(key)
+                if event:event.set()
+                if queued.cancel():self.folder_size_futures.pop(key,None);self.folder_size_events.pop(key,None)
+            self._submit_folder_size(self.hover_folder_size_futures,self.hover_folder_size_events,self.hover_size_pool,key)
         elif key not in self.folder_size_futures and key not in self.folder_size_queued:
             self.folder_size_queue.append(key);self.folder_size_queued.add(key);self.start_next_folder_size()
-    def folder_size_worker(self,path):
+    def folder_size_worker(self,path,cancel_event=None):
         total=0
         pending=[Path(path)]
-        while pending and not self._closing:
+        while pending and not self._closing and not (cancel_event and cancel_event.is_set()):
             current=pending.pop()
             try:
                 with os.scandir(current) as entries:
                     for entry in entries:
-                        if self._closing:return total
+                        if self._closing or (cancel_event and cancel_event.is_set()):return total
                         try:
                             if entry.is_dir(follow_symlinks=False):pending.append(Path(entry.path))
                             elif entry.is_file(follow_symlinks=False):total+=entry.stat(follow_symlinks=False).st_size
@@ -454,6 +564,10 @@ class VirtualGrid(QAbstractScrollArea):
         if self._closing:return
         self._closing=True
         for timer in (self.thumb_timer,self.scroll_settle_timer,self.hover_delay_timer,self.hover_animation_timer,self.favorite_picker_delay,self.favorite_click_timer,self.group_rename_timer,self.selection_scroll_timer):timer.stop()
+        self.wheel_scroller.stop()
+        for events in (self.folder_size_events,self.hover_folder_size_events):
+            for event in events.values():event.set()
+            events.clear()
         for futures in (self.thumb_futures,self.folder_futures,self.folder_size_futures,self.hover_folder_size_futures):
             for future in futures.values():future.cancel()
             futures.clear()
@@ -475,10 +589,38 @@ class VirtualGrid(QAbstractScrollArea):
         self.verticalScrollBar().setRange(0,max(0,h-self.viewport().height()));self.verticalScrollBar().setPageStep(self.viewport().height());self.viewport().update()
     def resizeEvent(self,e):self.recalc();super().resizeEvent(e)
     def scrollContentsBy(self,dx,dy):
-        # Shift already-painted rows and let Qt repaint only the newly exposed
-        # strip. A full viewport update on every scrollbar tick defeats this.
+        # Move the already-rendered viewport and let Qt repaint only the
+        # newly exposed strip. This matters especially during smooth scrolling:
+        # fully repainting every visible card on every animation frame causes
+        # avoidable main-thread work and makes the animation stutter.
         self.viewport().scroll(dx,dy)
-    def wheelEvent(self,e):self.verticalScrollBar().setValue(self.verticalScrollBar().value()-e.angleDelta().y());self.setFocus();e.accept()
+    def wheelEvent(self,e):
+        delta=e.angleDelta().y()
+        if delta:
+            distance=-(delta/120.0)*self.row_h*max(.1,min(12.0,float(getattr(self.explorer(),'wheel_scroll_rows',1))))
+        else:
+            distance=-e.pixelDelta().y()*max(.1/3.0,min(4.0,float(getattr(self.explorer(),'wheel_scroll_rows',1))/3.0))
+        if distance:
+            if getattr(self.explorer(),'smooth_wheel_scroll',False):
+                bar=self.verticalScrollBar();state=self.wheel_scroller.state()
+                base=self.wheel_scroller.finalPosition().y() if state!=QScroller.Inactive else bar.value()
+                target=max(0,min(bar.maximum(),base+distance))
+                duration=max(180,min(600,int(180+abs(distance)*.25)))
+                self.wheel_scroller.scrollTo(QPointF(0,target),duration)
+            else:
+                self.wheel_scroller.stop()
+                bar=self.verticalScrollBar();bar.setValue(bar.value()+round(distance))
+        self.setFocus();e.accept()
+    def event(self,e):
+        if e.type()==QEvent.ScrollPrepare:
+            e.setViewportSize(QSizeF(self.viewport().size()))
+            e.setContentPosRange(QRectF(0,0,0,self.verticalScrollBar().maximum()))
+            e.setContentPos(QPointF(0,self.verticalScrollBar().value()));e.accept();return True
+        if e.type()==QEvent.Scroll:
+            position=e.contentPos().y();self.verticalScrollBar().setValue(max(0,min(self.verticalScrollBar().maximum(),round(position))))
+            e.accept();return True
+        return super().event(e)
+    def stop_smooth_scroll(self):self.wheel_scroller.stop()
     def visible_range(self):
         top=self.verticalScrollBar().value(); bottom=top+self.viewport().height()
         if self.mode=='horizontal':return max(0,top//self.row_h-1),min(len(self.items),(bottom//self.row_h)+2)
@@ -490,24 +632,41 @@ class VirtualGrid(QAbstractScrollArea):
             area=self.viewport().rect();p.setPen(QColor('#d0a32d'));p.setFont(QFont('Segoe UI Symbol',54,QFont.Bold));p.drawText(QRect(0,area.height()//2-100,area.width(),90),Qt.AlignCenter,'◈')
             p.setPen(QColor('#e5e5e5'));p.setFont(QFont('Segoe UI',20,QFont.DemiBold));p.drawText(QRect(0,area.height()//2-8,area.width(),36),Qt.AlignCenter,'MAGELLAN')
             p.setPen(QColor('#92969d'));p.setFont(QFont('Segoe UI',11));p.drawText(QRect(0,area.height()//2+32,area.width(),32),Qt.AlignCenter,'Choose a folder to get started')
-            p.end();self._trim_cache_after_paint();return
+            p.end();self._trim_cache_after_paint()
+            return
         first,last=self.paint_range(e)
+        region=e.region();cache_enabled=getattr(self.explorer(),'thumbnail_cache_enabled',True)
+        paint_indices=[]
+        for i in range(first,last):
+            card_rect=self.card_rect(i)
+            # paint_range returns rows intersecting Qt's bounding rectangle.
+            # QRegion may contain separated damaged strips; skip cards that do
+            # not intersect the actual update region instead of redrawing the
+            # empty space between those strips.
+            if not cache_enabled or region.intersects(card_rect):paint_indices.append(i)
         if self.mode=='horizontal':
-            for i in range(first,last):self.paint_horizontal(p,i)
+            for i in paint_indices:self.paint_horizontal(p,i)
         else:
-            gap=9; cw=self.cell_w
-            for i in range(first,last):
-                row,col=divmod(i,self.columns);x=9+col*(cw+gap);y=row*self.row_h-self.verticalScrollBar().value();self.paint_card(p,i,QRect(int(x),int(y),int(cw),int(cw+48)))
+            for i in paint_indices:self.paint_card(p,i,self.card_rect(i))
+        if self.drop_indicator is not None:
+            index,before=self.drop_indicator
+            if first<=index<last:
+                if self.mode=='horizontal':
+                    r=QRect(10,index*self.row_h-self.verticalScrollBar().value(),self.viewport().width()-20,self.row_h-7);y=r.top()-4 if before else r.bottom()+4
+                    p.fillRect(QRect(r.left()+2,y-1,max(1,r.width()-4),3),QColor('#ffffff'));r=QRect()
+                else:
+                    row,col=divmod(index,self.columns);r=QRect(9+col*(self.cell_w+9),row*self.row_h-self.verticalScrollBar().value(),self.cell_w,self.cell_w+48);x=r.left()-5 if before else r.right()+5
+                    p.fillRect(QRect(x,r.top()+2,3,max(1,r.height()-4)),QColor('#ffffff'))
         if self.selection_dragging and self.selection_anchor is not None and self.selection_current is not None:
             rect=QRect(self.selection_anchor,self.selection_current).normalized();rect.translate(0,-self.verticalScrollBar().value());p.setPen(QPen(QColor(190,190,190,145),1));p.setBrush(QColor(170,170,170,55));p.drawRect(rect)
-        for i in range(first,last):
+        for i in paint_indices:
             item=self.items[i];selected=self.selection_key(item) in self.selected_paths
             if not selected and i!=self.navigation_index:continue
             if self.mode=='horizontal':r=QRect(10,i*self.row_h-self.verticalScrollBar().value(),self.viewport().width()-20,self.row_h-7)
             else:
                 row,col=divmod(i,self.columns);r=QRect(9+col*(self.cell_w+9),row*self.row_h-self.verticalScrollBar().value(),self.cell_w,self.cell_w+48)
             p.setPen(QPen(QColor('#ffffff'),3));p.setBrush(Qt.NoBrush);p.drawRect(r.adjusted(1,1,-2,-2))
-        if self.hover_index>=first and self.hover_index<last and getattr(self.explorer(),'hover_details_enabled',True):
+        if self.hover_index in paint_indices and getattr(self.explorer(),'hover_details_enabled',True):
             i=self.hover_index
             if self.mode=='horizontal':
                 y=i*self.row_h-self.verticalScrollBar().value();preview=QRect(14,y+4,max(1,self.row_h-15),max(1,self.row_h-15))
@@ -515,6 +674,13 @@ class VirtualGrid(QAbstractScrollArea):
                 row,col=divmod(i,self.columns);x=9+col*(self.cell_w+9);y=row*self.row_h-self.verticalScrollBar().value();preview=QRect(x+1,y+1,max(1,self.cell_w-2),max(1,self.cell_w-2))
             self.paint_hover_details(p,preview,self.items[i])
         p.end();self._trim_cache_after_paint()
+
+    def card_rect(self,index):
+        if self.mode=='horizontal':
+            y=index*self.row_h-self.verticalScrollBar().value()
+            return QRect(10,y,self.viewport().width()-20,self.row_h-7)
+        row,col=divmod(index,self.columns);x=9+col*(self.cell_w+9);y=row*self.row_h-self.verticalScrollBar().value()
+        return QRect(x,y,self.cell_w,self.cell_w+48)
     def paint_range(self,event):
         # The cache-disabled mode needs a complete visible pass so its RAM cache
         # can retain all displayed items. With caching enabled, paint only the
@@ -561,11 +727,18 @@ class VirtualGrid(QAbstractScrollArea):
                             if e.is_file() and p.suffix.lower() in (MEDIA_EXTS|PDF_EXTS):
                                 if p.suffix.casefold() in VIDEO_EXTS or self.preview_is_readable(p):return str(p)
                             if e.is_dir() and (not e.name.startswith('.') or e.name.startswith('. ')): nq.append(p)
-                    except: pass
+                    except OSError:
+                        logger.debug('Could not inspect folder preview directory %s',d,exc_info=True)
                 q=nq; depth+=1
         except Exception:
             logger.debug('Could not resolve a folder preview in %s',folder,exc_info=True)
         return None
+    def resolve_folder_thumbnail(self,folder):
+        """Resolve and persist a pinned preview on a worker, never during paint/poll."""
+        source=self.folder_image(folder)
+        if source and self.is_persistently_kept(folder):
+            return self.persist_folder_thumb(folder,source)
+        return source
     def preview_is_readable(self,path):
         """Reject incomplete/corrupt previews and keep searching for a usable sibling."""
         try:
@@ -585,8 +758,8 @@ class VirtualGrid(QAbstractScrollArea):
             p=os.path.normcase(os.path.abspath(os.path.normpath(os.fspath(folder))))
             roots=self._thumb_cache_roots()
             return p in roots or os.path.dirname(p) in roots
-        except Exception:
-            pass
+        except (OSError,TypeError,ValueError):
+            logger.debug('Could not check pinned-cache membership for %s',folder,exc_info=True)
         return False
 
     def _persistent_folder_thumb_path(self, folder):
@@ -601,6 +774,7 @@ class VirtualGrid(QAbstractScrollArea):
     def persist_folder_thumb(self, folder, source):
         p=self._persistent_folder_thumb_path(folder)
         if not p or not source: return source
+        temporary=None
         try:
             p.parent.mkdir(parents=True,exist_ok=True)
             img=self.thumbnail_worker(str(source),512,512)
@@ -611,10 +785,11 @@ class VirtualGrid(QAbstractScrollArea):
                 if ok and p.exists() and p.stat().st_size>0:
                     return str(p)
         except Exception:
-            logger.debug('Could not resolve shortcut %s',p,exc_info=True)
+            logger.warning('Could not persist folder thumbnail %s',p,exc_info=True)
         finally:
-            try:temporary.unlink(missing_ok=True)
-            except (OSError,UnboundLocalError):pass
+            if temporary is not None:
+                try:temporary.unlink(missing_ok=True)
+                except OSError:logger.debug('Could not clean temporary thumbnail %s',temporary,exc_info=True)
         return None
     def ensure_folder_thumb(self,path):
         if self._closing:return None
@@ -640,7 +815,7 @@ class VirtualGrid(QAbstractScrollArea):
             self.folder_cache.pop(key,None)
         if key in self.folder_cache:return self.folder_cache[key]
         if key in self.folder_futures:return None
-        fut=self.folder_pool.submit(self.folder_image,path);self.folder_futures[key]=fut;return None
+        fut=self.folder_pool.submit(self.resolve_folder_thumbnail,path);self.folder_futures[key]=fut;return None
     def poll_async(self):
         changed_indices=set();sizes_changed=False
         first,last=self.visible_range() if self.items and getattr(self,'row_h',0)>0 else (0,0);visible_paths={};visible_sources={}
@@ -678,17 +853,18 @@ class VirtualGrid(QAbstractScrollArea):
                     val=f.result()
                     parent=self.explorer()
                     if val and parent is not None and key in getattr(parent,'pinned_folders',set()):
-                        val=self.persist_folder_thumb(key,val); parent.pinned_thumbs[key]=val; parent.save_settings();parent.schedule_disk_thumbnail_cache_trim()
+                        parent.pinned_thumbs[key]=val;parent.save_settings();parent.schedule_disk_thumbnail_cache_trim()
                     self.folder_cache[key]=val
                 except Exception:
                     logger.exception('Folder thumbnail worker failed for %s',key)
                     self.folder_cache[key]=None
                 changed_indices.update(visible_paths.get(key,()))
         for futures in (self.folder_size_futures,self.hover_folder_size_futures):
+            events=self.folder_size_events if futures is self.folder_size_futures else self.hover_folder_size_events
             for key,f in list(futures.items()):
                 if not f.done():continue
-                futures.pop(key,None)
-                if f.cancelled():continue
+                futures.pop(key,None);cancel_event=events.pop(key,None)
+                if f.cancelled() or (cancel_event is not None and cancel_event.is_set()):continue
                 try:
                     size=max(0,int(f.result()));self.folder_size_cache[key]=size;checked_at=time.time();self.folder_size_cache_checked_at[key]=checked_at
                     for item in self.items_by_path.get(key,()):
@@ -706,6 +882,9 @@ class VirtualGrid(QAbstractScrollArea):
                     logger.exception('Folder size calculation failed for %s',key)
                 sizes_changed=True
         self.start_next_folder_size()
+        if sizes_changed:
+            parent=self.explorer()
+            if parent is not None:parent.update_selection_button()
         for i in changed_indices:
             if self.mode=='horizontal':rect=QRect(10,i*self.row_h-self.verticalScrollBar().value(),self.viewport().width()-20,self.row_h-7)
             else:
@@ -722,9 +901,17 @@ class VirtualGrid(QAbstractScrollArea):
         now=__import__('time').monotonic()
         dt=now-self.last_scroll_time if self.last_scroll_time else 1
         speed=abs(value-self.last_scroll_value)/max(dt,0.001)
-        self.fast_scroll=speed>900
+        smooth_active=self.wheel_scroller.state()!=QScroller.Inactive
+        # QScroller advances in small increments, so velocity alone can miss
+        # fast-scroll mode. Avoid starting thumbnail work while its animation
+        # is moving; that competes with painting and causes frame hitches.
+        self.fast_scroll=smooth_active or speed>900
         self.last_scroll_value=value;self.last_scroll_time=now
         self.scroll_settle_timer.start(220)
+        if smooth_active:return
+        self.update_scroll_work()
+
+    def update_scroll_work(self):
         # Folder discovery is much more expensive than decoding an already-known image.
         # When the scrollbar jumps, cancel queued folder scans that are no longer near
         # the viewport so the newly visible folders get the worker slots first. Cached
@@ -754,7 +941,11 @@ class VirtualGrid(QAbstractScrollArea):
                 self.folder_futures.pop(key,None)
 
     def scroll_settled(self):
+        if self.wheel_scroller.state()!=QScroller.Inactive:
+            self.scroll_settle_timer.start(100)
+            return
         self.fast_scroll=False
+        self.update_scroll_work()
         cursor=self.viewport().mapFromGlobal(QCursor.pos())
         self.set_hover_index(self.thumbnail_hit(cursor) if self.viewport().rect().contains(cursor) else -1)
         self.viewport().update()
@@ -841,7 +1032,10 @@ class VirtualGrid(QAbstractScrollArea):
     @staticmethod
     def pixmap_bytes(pixmap):return pixmap.width()*pixmap.height()*max(1,(pixmap.depth()+7)//8)
     def set_cache_limit_mib(self,limit_mib):
-        self.cache_limit_bytes=max(16,min(8192,int(limit_mib)))*1024*1024
+        total_limit=max(16,min(8192,int(limit_mib)))*1024*1024
+        self.card_cache_limit_bytes=min(64*1024*1024,total_limit//4)
+        self.cache_limit_bytes=total_limit-self.card_cache_limit_bytes
+        self.trim_card_cache()
         while self.cache and self.cache_bytes>self.cache_limit_bytes:
             _,oldest=self.cache.popitem(last=False)
             self.cache_bytes=max(0,self.cache_bytes-self.pixmap_bytes(oldest))
@@ -849,41 +1043,59 @@ class VirtualGrid(QAbstractScrollArea):
 
     def icon(self,k):return {'folder':'📁','video':'▶','audio':'♫','document':'PDF','file':'•','image':'🖼','favorite_group':'★'}.get(k,'•')
     def paint_card(self,p,i,r):
-        it=self.items[i];p.setPen(QPen(QColor('#171a24')));p.setBrush(QColor('#020513'));p.drawRect(r)
-        # Keep the preview perfectly square. The slider controls the target
-        # thumbnail size; the actual cell width adapts to the available window.
-        side=max(1,min(r.width()-2,self.cell_w if self.mode=='vertical' else r.width()-2))
-        preview=QRect(r.x()+1,r.y()+1,side,side)
-        source=None
-        if it['kind'] in ('image','video') or (it['kind']=='document' and Path(it['path']).suffix.casefold() in PDF_EXTS): source=str(it['path'])
-        elif it.get('kind')=='favorite_group':source=self.folder_custom.get('favgroup:'+str(it['path']).split('://',1)[1]) or (self.ensure_folder_thumb(it['preview_path']) if it.get('preview_path') else None)
-        elif it['is_dir']: source=self.ensure_folder_thumb(it['path'])
+        it=self.items[i];meta=self.paint_metadata.get(id(it),('',self.label_prefix(it),False));source=self.card_thumbnail_source(it,meta)
+        side=max(1,min(r.width()-2,self.cell_w if self.mode=='vertical' else r.width()-2));thumb_key=(source,side,side) if source else None
+        thumb_pix=self.cache.get(thumb_key) if thumb_key else None
+        thumb_signature=thumb_pix.cacheKey() if thumb_pix is not None else None
+        dpr=float(self.devicePixelRatioF())
+        cache_key=(str(it.get('path','')),str(it.get('name','')),it.get('kind'),bool(it.get('is_dir')),r.width(),r.height(),dpr,source,thumb_signature)
+        cached=self.card_cache.get(cache_key)
+        cache_enabled=getattr(self.explorer(),'thumbnail_cache_enabled',True)
+        if cached is not None and cache_enabled:
+            self.card_cache.move_to_end(cache_key)
+            # A placeholder card can be cached while fast scrolling deliberately
+            # defers thumbnail work. Once scrolling settles, keep requesting the
+            # missing preview from this cache-hit path so the placeholder is
+            # replaced when the worker completes.
+            if source and thumb_pix is None and not self.fast_scroll and thumb_key not in self.thumb_futures:
+                self.pix(source,QSize(side,side))
+        else:
+            cached=self.render_card_pixmap(i,r.size(),side,source,meta,dpr)
+            if cached is not None and cache_enabled:
+                self.card_cache[cache_key]=cached;self.card_cache_bytes+=self.pixmap_bytes(cached)
+                self.trim_card_cache()
+        if cached is not None:p.drawPixmap(r.topLeft(),cached)
+        if self.image_search_active and getattr(self,'search_hover',-1)==i:
+            preview=QRect(r.x()+1,r.y()+1,side,side);p.setPen(QPen(QColor('#ffffff'),3));p.setBrush(Qt.NoBrush);p.drawRect(preview.adjusted(1,1,-1,-1))
+    def card_thumbnail_source(self,it,meta):
+        if it['kind'] in ('image','video') or (it['kind']=='document' and meta[0] in PDF_EXTS):return str(it['path'])
+        if it.get('kind')=='favorite_group':return self.folder_custom.get('favgroup:'+str(it['path']).split('://',1)[1]) or (self.ensure_folder_thumb(it['preview_path']) if it.get('preview_path') else None)
+        if it['is_dir']:return self.ensure_folder_thumb(it['path'])
+        return None
+    def render_card_pixmap(self,index,size,side,source,meta,dpr):
+        it=self.items[index];pixmap=QPixmap(max(1,int(round(size.width()*dpr))),max(1,int(round(size.height()*dpr))))
+        if pixmap.isNull():return None
+        pixmap.setDevicePixelRatio(dpr);pixmap.fill(Qt.transparent);p=QPainter(pixmap);r=QRect(0,0,size.width(),size.height());p.setPen(QPen(QColor('#171a24')));p.setBrush(QColor('#020513'));p.drawRect(r)
+        preview=QRect(1,1,side,side)
         if source:
             px=self.pix(source,QSize(preview.width(),preview.height()))
             if px:p.drawPixmap(preview,px)
             else:self.draw_center(p,preview,self.icon(it['kind']),48)
         else:self.draw_center(p,preview,self.icon(it['kind']),48)
-        label_y=r.y()+side+5
+        label_y=side+5
         if it.get('kind')=='favorite_group':
-            p.setPen(QColor('#d0a32d'));p.setFont(QFont('Segoe UI Symbol',11,QFont.Bold));p.drawText(QRect(r.x()+7,label_y,18,24),Qt.AlignCenter,'★')
+            p.setPen(QColor('#d0a32d'));p.setFont(self.paint_fonts['group']);p.drawText(QRect(7,label_y,18,24),Qt.AlignCenter,'★')
         if it['is_dir']:
-            # Compact white folder glyph, reduced ~15% from the previous icon.
-            p.save();p.setPen(Qt.NoPen);p.setBrush(QColor('#f1f1f1'))
-            fx=r.x()+7; fy=label_y+5
-            p.drawRoundedRect(QRect(fx,fy,13,10),2,2)
-            p.drawRect(QRect(fx+2,fy-2,5,4));p.restore()
-            text_x=r.x()+25
-        else:
-            text_x=r.x()+(29 if it.get('kind')=='favorite_group' else 7)
-        if not it['is_dir'] and it.get('kind')=='image' and Path(str(it.get('path',''))).suffix.casefold()!='.gif' and not self.image_name_icon.isNull():
-            p.drawPixmap(QRect(text_x,label_y+4,16,16),self.image_name_icon);text_x+=20
-        p.setPen(QColor('#ddd'));p.setFont(QFont('Segoe UI',11));p.drawText(QRect(text_x,label_y,r.width()-(text_x-r.x())-7,38),Qt.TextWordWrap,self.label_prefix(it)+it['name'])
-        if self.image_search_active and getattr(self,'search_hover',-1)==i:
-            p.setPen(QPen(QColor('#ffffff'),3));p.setBrush(Qt.NoBrush);p.drawRect(preview.adjusted(1,1,-1,-1))
+            p.save();p.setPen(Qt.NoPen);p.setBrush(QColor('#f1f1f1'));p.drawRoundedRect(QRect(7,label_y+5,13,10),2,2);p.drawRect(QRect(9,label_y+3,5,4));p.restore();text_x=25
+        else:text_x=29 if it.get('kind')=='favorite_group' else 7
+        if meta[2]:p.drawPixmap(QRect(text_x,label_y+4,16,16),self.image_name_icon);text_x+=20
+        p.setPen(QColor('#ddd'));p.setFont(self.paint_fonts['label']);p.drawText(QRect(text_x,label_y,size.width()-(text_x-7)-7,38),Qt.TextWordWrap,meta[1]+it['name'])
+        p.end();return pixmap
     def paint_horizontal(self,p,i):
         it=self.items[i];y=i*self.row_h-self.verticalScrollBar().value();r=QRect(10,y,self.viewport().width()-20,self.row_h-7);p.setBrush(QColor('#020513'));p.setPen(QPen(QColor('#171a24')));p.drawRect(r)
         box=QRect(r.x()+4,r.y()+4, r.height()-8,r.height()-15)
-        source=str(it['path']) if it['kind'] in ('image','video') or (it['kind']=='document' and Path(it['path']).suffix.casefold() in PDF_EXTS) else (self.ensure_folder_thumb(it['path']) if it['is_dir'] else None)
+        paint_meta=self.paint_metadata.get(id(it),('',self.label_prefix(it),False))
+        source=str(it['path']) if it['kind'] in ('image','video') or (it['kind']=='document' and paint_meta[0] in PDF_EXTS) else (self.ensure_folder_thumb(it['path']) if it['is_dir'] else None)
         if source:
             px=self.pix(source,box.size())
             if px:p.drawPixmap(box,px)
@@ -895,10 +1107,9 @@ class VirtualGrid(QAbstractScrollArea):
             fx=text_x; fy=r.y()+15
             p.drawRoundedRect(QRect(fx,fy,13,10),2,2);p.drawRect(QRect(fx+2,fy-2,5,4));p.restore()
             text_x+=20
-        if not it['is_dir'] and it.get('kind')=='image' and Path(str(it.get('path',''))).suffix.casefold()!='.gif' and not self.image_name_icon.isNull():
-            p.drawPixmap(QRect(text_x,r.y()+16,16,16),self.image_name_icon);text_x+=20
-        p.setPen(QColor('#eee'));p.setFont(QFont('Segoe UI',12));p.drawText(QRect(text_x,r.y()+12,r.width()-text_x+r.x()-15,25),Qt.AlignLeft|Qt.AlignVCenter,self.label_prefix(it)+it['name'])
-        p.setPen(QColor('#777'));p.setFont(QFont('Segoe UI',10));p.drawText(QRect(box.right()+15,r.y()+40,r.width()-box.width()-30,22),Qt.AlignLeft|Qt.AlignVCenter,('Folder' if it['is_dir'] else it['kind'].title())+' • '+datefmt(it['mtime']))
+        if paint_meta[2]:p.drawPixmap(QRect(text_x,r.y()+16,16,16),self.image_name_icon);text_x+=20
+        p.setPen(QColor('#eee'));p.setFont(self.paint_fonts['horizontal_label']);p.drawText(QRect(text_x,r.y()+12,r.width()-text_x+r.x()-15,25),Qt.AlignLeft|Qt.AlignVCenter,paint_meta[1]+it['name'])
+        p.setPen(QColor('#777'));p.setFont(self.paint_fonts['horizontal_detail']);p.drawText(QRect(box.right()+15,r.y()+40,r.width()-box.width()-30,22),Qt.AlignLeft|Qt.AlignVCenter,('Folder' if it['is_dir'] else it['kind'].title())+' • '+datefmt(it['mtime']))
     def label_prefix(self,item):
         if item.get('is_dir') or item.get('kind')=='favorite_group':return ''
         suffix=Path(str(item.get('path',''))).suffix.casefold()
@@ -906,7 +1117,7 @@ class VirtualGrid(QAbstractScrollArea):
         if item.get('kind')=='image':return '' if not self.image_name_icon.isNull() else '▧  '
         if item.get('kind')=='audio':return '♫  '
         return '▤  '
-    def draw_center(self,p,r,text,size):p.setPen(QColor('#eee'));p.setFont(QFont('Segoe UI',size));p.drawText(r,Qt.AlignCenter,text)
+    def draw_center(self,p,r,text,size):p.setPen(QColor('#eee'));p.setFont(self.paint_fonts['horizontal_center'] if size==32 else self.paint_fonts['center']);p.drawText(r,Qt.AlignCenter,text)
     def paint_hover_details(self,p,preview,item):
         if item.get('kind')=='favorite_group':
             height=max(28,min(40,int(preview.height()*.18)));elapsed=max(0,time.monotonic()-self.hover_animation_started);progress=min(1.0,elapsed/.18) if self.hover_animation_started else 0.0;y=preview.y()-height+round(height*(1-(1-progress)**3));rect=QRect(preview.x(),y,preview.width(),height);self.hover_overlay_rect=rect;p.save();p.setClipRect(self.viewport().rect());p.fillRect(rect,QColor(0,0,0,190));self.hover_favorite_rect=QRect(preview.right()-32,y+2,28,height-4);p.setPen(QColor('#fff'));p.setFont(QFont('Segoe UI',15,QFont.Bold));p.drawText(self.hover_favorite_rect,Qt.AlignCenter,'−');p.restore();return
@@ -960,7 +1171,7 @@ class VirtualGrid(QAbstractScrollArea):
         if getattr(self.explorer(),'sort',None)!='size':
             for key,f in list(self.folder_size_futures.items()):
                 if not f.running() and key!=keep_key:
-                    f.cancel();self.folder_size_futures.pop(key,None)
+                    f.cancel();self.folder_size_futures.pop(key,None);self.folder_size_events.pop(key,None)
         if index>=0 and getattr(self.explorer(),'hover_details_enabled',True):
             self.hover_delay_timer.start(max(0,int(getattr(self.explorer(),'hover_details_delay',500))))
         self.viewport().update()
@@ -1009,10 +1220,13 @@ class VirtualGrid(QAbstractScrollArea):
         else:self.selected_paths.add(key)
         self.viewport().update();self.explorer().update_selection_button()
     def select_all_current(self):
-        self.selected_paths.update(self.selection_key(item) for item in self.items if self.selectable_item(item) and item.get('path'))
+        keys={self.selection_key(item) for item in self.items if self.selectable_item(item) and item.get('path')}
+        if keys and keys.issubset(self.selected_paths):
+            self.remember_deselection(keys);self.selected_paths.difference_update(keys)
+        else:self.selected_paths.update(keys)
         self.viewport().update();self.explorer().update_selection_button()
     def begin_rect_selection(self,pos):
-        self.setFocus();self.selection_dragging=True;self.selection_drag_moved=False;self.selection_anchor=QPoint(pos.x(),pos.y()+self.verticalScrollBar().value());self.selection_current=QPoint(self.selection_anchor);self.selection_base=set(self.selected_paths);self.last_mouse_pos=QPoint(pos);self.selection_scroll_timer.start();self.navigation_index=-1;self.set_hover_index(-1);self.favorite_picker_delay.stop();self.favorite_picker_key=None;self.viewport().update()
+        self.setFocus();self.selection_dragging=True;self.selection_scroll_accumulator=0.0;self.selection_drag_moved=False;self.selection_anchor=QPoint(pos.x(),pos.y()+self.verticalScrollBar().value());self.selection_current=QPoint(self.selection_anchor);self.selection_base=set(self.selected_paths);self.last_mouse_pos=QPoint(pos);self.selection_scroll_timer.start();self.navigation_index=-1;self.set_hover_index(-1);self.favorite_picker_delay.stop();self.favorite_picker_key=None;self.viewport().update()
     def rect_selection_items(self,rect):
         if self.mode=='horizontal':
             first=max(0,rect.top()//self.row_h);last=min(len(self.items)-1,rect.bottom()//self.row_h)
@@ -1035,10 +1249,15 @@ class VirtualGrid(QAbstractScrollArea):
         self.selected_paths=self.selection_base.symmetric_difference(inside);self.viewport().update();self.explorer().update_selection_button()
     def auto_scroll_selection(self):
         if not self.selection_dragging:return
-        y=self.last_mouse_pos.y();height=self.viewport().height();edge=140;delta=0
-        if y<edge:delta=-max(1,round((edge-y)/edge*44))
-        elif y>height-edge:delta=max(1,round((y-(height-edge))/edge*44))
+        y=self.last_mouse_pos.y();height=self.viewport().height();edge=240;speed=0.0
+        if y<edge:
+            intensity=max(0.0,min(1.0,(edge-y)/edge));speed=-(.25+159.75*intensity**2.2)
+        elif y>height-edge:
+            intensity=max(0.0,min(1.0,(y-(height-edge))/edge));speed=.25+159.75*intensity**2.2
+        self.selection_scroll_accumulator+=speed
+        delta=int(self.selection_scroll_accumulator)
         if delta:
+            self.selection_scroll_accumulator-=delta
             bar=self.verticalScrollBar();old=bar.value();bar.setValue(max(0,min(bar.maximum(),old+delta)))
             if bar.value()!=old:self.update_rect_selection(self.last_mouse_pos)
     def finish_rect_selection(self,pos):
@@ -1109,10 +1328,6 @@ class VirtualGrid(QAbstractScrollArea):
                     else:self.clear_selection()
                     e.accept();return True
                 if mods&Qt.ShiftModifier:self.begin_rect_selection(pos);e.accept();return True
-                if (mods&Qt.ControlModifier) and not self.hover_favorite_rect.contains(pos) and not (getattr(self.explorer(),'in_favorites_view',False) and getattr(self.explorer(),'favorite_organize_mode',False)):
-                    i=self.hit(pos)
-                    if 0<=i<len(self.items) and self.selectable_item(self.items[i]):self.toggle_selected_path(self.items[i]['path'])
-                    e.accept();return True
                 if not self.hover_favorite_rect.contains(pos) and self.hit(pos)<0 and self.selected_paths:self.clear_selection()
             if e.type()==QEvent.MouseButtonRelease and e.button()==Qt.LeftButton and self.selection_dragging:
                 self.finish_rect_selection(e.position().toPoint());e.accept();return True
@@ -1120,7 +1335,7 @@ class VirtualGrid(QAbstractScrollArea):
                 pos=e.position().toPoint()
                 if self.selection_dragging:self.update_rect_selection(pos);return True
                 if self.navigation_index>=0:self.navigation_index=-1;self.viewport().update()
-                if getattr(self.explorer(),'in_favorites_view',False) and getattr(self.explorer(),'favorite_organize_mode',False) and self.drag_source_index>=0 and e.buttons()&Qt.LeftButton:
+                if getattr(self.explorer(),'favorite_organize_mode',False) and self.drag_source_index>=0 and e.buttons()&Qt.LeftButton:
                     if not self.drag_started and (pos-self.drag_start).manhattanLength()>=QApplication.startDragDistance():self.start_favorite_drag()
                     e.accept();return True
                 if self.hover_favorite_rect.contains(pos) and 0<=self.hover_index<len(self.items) and self.items[self.hover_index].get('kind')!='favorite_group':
@@ -1144,10 +1359,13 @@ class VirtualGrid(QAbstractScrollArea):
                     return False
                 self.favorite_picker_delay.stop();self.favorite_picker_hover_key=None;self.set_hover_index(-1);self.search_hover=-1;self.viewport().update();return False
             if e.type() in (QEvent.DragEnter,QEvent.DragMove):
-                if e.mimeData().hasText():e.acceptProposedAction();return True
+                if getattr(self.explorer(),'favorite_organize_mode',False) and e.mimeData().hasText():
+                    pos=e.position().toPoint();index=self.hit(pos);self.drop_indicator=(index,pos.x()<(self.item_rect(index).center().x()) if index>=0 else True) if index>=0 else None;self.viewport().update();e.acceptProposedAction();return True
+                return False
             if e.type()==QEvent.Drop:
-                self.explorer().handle_favorite_drop(e.mimeData().text(),self.hit(e.position().toPoint()));e.acceptProposedAction();return True
-            if getattr(self.explorer(),'in_favorites_view',False) and getattr(self.explorer(),'favorite_organize_mode',False):
+                self.explorer().handle_favorite_drop(e.mimeData().text(),self.hit(e.position().toPoint()),self.drop_indicator[1] if self.drop_indicator else True);self.drop_indicator=None;self.viewport().update();e.acceptProposedAction();return True
+            if e.type()==QEvent.DragLeave:self.drop_indicator=None;self.viewport().update();return False
+            if getattr(self.explorer(),'favorite_organize_mode',False):
                 if e.type()==QEvent.MouseButtonDblClick and time.monotonic()-self.last_favorite_drag<QApplication.doubleClickInterval()/1000+0.1:
                     e.accept();return True
                 if e.type()==QEvent.MouseButtonPress and e.button()==Qt.LeftButton:
@@ -1186,7 +1404,12 @@ class VirtualGrid(QAbstractScrollArea):
         ghost=self.favorite_drag_pixmap(item)
         if not ghost.isNull():drag.setPixmap(ghost);drag.setHotSpot(QPoint(ghost.width()//2,ghost.height()//2))
         drag.exec(Qt.MoveAction)
-        self.last_favorite_drag=time.monotonic();self.drag_source_index=-1;self.drag_started=False
+        self.last_favorite_drag=time.monotonic();self.drag_source_index=-1;self.drag_started=False;self.drop_indicator=None;self.viewport().update()
+
+    def item_rect(self,index):
+        if not 0<=index<len(self.items):return QRect()
+        if self.mode=='horizontal':return QRect(10,index*self.row_h-self.verticalScrollBar().value(),self.viewport().width()-20,self.row_h-7)
+        row,col=divmod(index,self.columns);return QRect(9+col*(self.cell_w+9),row*self.row_h-self.verticalScrollBar().value(),self.cell_w,self.cell_w+48)
 
     def favorite_drag_pixmap(self,item):
         size=max(72,min(144,getattr(self,'cell_w',120)));preview=QRect(3,3,size-6,size-30)
@@ -1216,7 +1439,7 @@ class VirtualGrid(QAbstractScrollArea):
         self.viewport().update()
 
     def mouseMoveEvent(self,e):
-        if self.drag_source_index>=0 and e.buttons() & Qt.LeftButton and not self.drag_started and (e.position().toPoint()-self.drag_start).manhattanLength()>=QApplication.startDragDistance():
+        if getattr(self.explorer(),'favorite_organize_mode',False) and self.drag_source_index>=0 and e.buttons() & Qt.LeftButton and not self.drag_started and (e.position().toPoint()-self.drag_start).manhattanLength()>=QApplication.startDragDistance():
             self.start_favorite_drag();e.accept();return
         if self.image_search_active:
             self.search_hover=self.thumbnail_hit(e.position().toPoint())
@@ -1227,7 +1450,7 @@ class VirtualGrid(QAbstractScrollArea):
         self.setFocus()
         if e.button()==Qt.LeftButton and self.hover_index>=0 and self.hover_favorite_rect.contains(e.position().toPoint()):
             self.favorite_picker_delay.stop();self.toggleItemFavorite.emit(str(self.items[self.hover_index]['path']));e.accept();return
-        if e.button()==Qt.LeftButton and getattr(self.explorer(),'in_favorites_view',False) and getattr(self.explorer(),'favorite_organize_mode',False):
+        if e.button()==Qt.LeftButton and getattr(self.explorer(),'favorite_organize_mode',False):
             i=self.hit(e.position().toPoint())
             if i>=0:self.drag_source_index=i;self.drag_start=e.position().toPoint();self.drag_started=False;e.accept();return
         if e.button()==Qt.RightButton:
@@ -1236,7 +1459,7 @@ class VirtualGrid(QAbstractScrollArea):
                 self.set_image_search_active(False);explorer.image_search_mode=False
                 if hasattr(explorer,'status'):explorer.status.setText('Image search off')
                 e.accept();return
-            if getattr(explorer,'in_favorites_view',False) and getattr(explorer,'favorite_organize_mode',False):
+            if getattr(explorer,'favorite_organize_mode',False):
                 explorer.set_favorite_organization_mode(False);e.accept();return
             self.goBack.emit();e.accept();return
         if e.button()==Qt.MiddleButton:
@@ -1251,7 +1474,7 @@ class VirtualGrid(QAbstractScrollArea):
                     self.explorer().reveal_in_folder(str(self.items[i]['path']));e.accept();return
                 if getattr(self.explorer(),'in_favorites_view',False) and not getattr(self.explorer(),'favorite_organize_mode',False) and self.items[i].get('kind')=='favorite_group' and self.group_name_hit(self.items[i],e.position().toPoint()):
                     self.favorite_click_timer.stop();self.pending_group_rename_id=str(self.items[i]['path']).split('://',1)[-1];self.group_rename_timer.start(QApplication.doubleClickInterval()+80);e.accept();return
-                if getattr(self.explorer(),'in_favorites_view',False) and getattr(self.explorer(),'favorite_organize_mode',False):self.drag_source_index=i;self.drag_start=e.position().toPoint();self.drag_started=False;e.accept();return
+                if getattr(self.explorer(),'favorite_organize_mode',False):self.drag_source_index=i;self.drag_start=e.position().toPoint();self.drag_started=False;e.accept();return
                 if self.name_hit(i,e.position().toPoint()) and self.items[i].get('kind')!='favorite_group':
                     path=str(self.items[i]['path'])
                     if self.items[i].get('is_dir'):self.explorer().reveal(path)
@@ -1274,6 +1497,7 @@ class VirtualGrid(QAbstractScrollArea):
         explorer=self.explorer()
         if group_id and getattr(explorer,'in_favorites_view',False) and not getattr(explorer,'favorite_organize_mode',False):explorer.rename_favorite_group(group_id)
     def mouseDoubleClickEvent(self,e):
+        if getattr(self.explorer(),'favorite_organize_mode',False):e.accept();return
         if not getattr(self.explorer(),'in_favorites_view',False):super().mouseDoubleClickEvent(e);return
         if time.monotonic()-self.last_favorite_drag<QApplication.doubleClickInterval()/1000+0.1:e.accept();return
         if e.button()==Qt.LeftButton:
@@ -1305,8 +1529,8 @@ def make_boat_icon():
     return QIcon(QPixmap.fromImage(QImage.fromData(svg.encode('utf-8'))))
 
 class SafeTabBar(QTabBar):
-    closeRequested=Signal(int)
-    def __init__(self,parent=None):super().__init__(parent);self._last_middle_pos=None;self._last_middle_time=0.0;self._hovered_tab=-1;self.selected_tabs=set();self.selection_anchor=-1;self._wheel_remainder=0;self._colored_tab_indices={};self.setMouseTracking(True);self.setUsesScrollButtons(True)
+    closeRequested=Signal(int);dragStarted=Signal();dragFinished=Signal()
+    def __init__(self,parent=None):super().__init__(parent);self._last_middle_pos=None;self._last_middle_time=0.0;self._hovered_tab=-1;self.selected_tabs=set();self.selection_anchor=-1;self._wheel_remainder=0;self._colored_tab_indices={};self._press_pos=None;self._press_tab=-1;self._dragging_tabs=False;self.setMouseTracking(True);self.setUsesScrollButtons(True)
     def setTabData(self,index,data):
         super().setTabData(index,data)
         if isinstance(data,str) and data:self._colored_tab_indices[index]=data
@@ -1335,6 +1559,7 @@ class SafeTabBar(QTabBar):
             if idx>=0 and idx==self._hovered_tab and self.close_rect(idx).contains(pos):
                 self.closeRequested.emit(idx);e.accept();return
             if idx>=0:
+                self._press_pos=pos;self._press_tab=idx;self._dragging_tabs=False
                 if e.modifiers()&Qt.ControlModifier:self.select_range(idx)
                 else:self.selection_anchor=idx;self.selected_tabs={idx};self.update()
         if e.button()==Qt.MiddleButton:
@@ -1356,7 +1581,15 @@ class SafeTabBar(QTabBar):
         if idx!=self._hovered_tab:self._hovered_tab=idx;self.update()
         if idx>=0 and self.close_rect(idx).contains(pos):self.setCursor(Qt.PointingHandCursor)
         else:self.setCursor(Qt.ArrowCursor)
-        e.accept()
+        if self._press_tab>=0 and e.buttons()&Qt.LeftButton and not self._dragging_tabs and (pos-self._press_pos).manhattanLength()>=QApplication.startDragDistance():
+            self._dragging_tabs=True;self.dragStarted.emit()
+        if self._dragging_tabs and e.buttons()&Qt.LeftButton and idx>=0 and idx!=self._press_tab:
+            old_index=self._press_tab;self.moveTab(old_index,idx);self._press_tab=idx
+        super().mouseMoveEvent(e)
+    def mouseReleaseEvent(self,e):
+        was_dragging=self._dragging_tabs;self._press_pos=None;self._press_tab=-1;self._dragging_tabs=False
+        super().mouseReleaseEvent(e)
+        if was_dragging:self.dragFinished.emit()
     def leaveEvent(self,e):
         if self._hovered_tab!=-1:self._hovered_tab=-1;self.update()
         self.setCursor(Qt.ArrowCursor);super().leaveEvent(e)
@@ -1739,8 +1972,9 @@ class MediaViewer(QMainWindow):
 class Explorer(QMainWindow):
     def __init__(self):
         super().__init__();self._closing=False;self.setWindowTitle('Magellan');icon_root=Path(sys._MEIPASS) if getattr(sys,'frozen',False) else Path(__file__).resolve().parent.parent;self.icon_root=icon_root;self.icon_dir=icon_root/'Alternative Icons';icon_path=icon_root/'MainIcon.ico';self.app_icon=QIcon(str(icon_path)) if icon_path.is_file() else make_boat_icon();self.setWindowIcon(self.app_icon);QApplication.setWindowIcon(self.app_icon);self.resize(1900,1000);self.window_cycle=0;self.in_favorites_view=False;self.setStyleSheet(QSS)
-        self.hover_details_enabled=True;self.hover_details_delay=500;self.hover_details_placement='top';self.slideshow_interval_ms=5000;self.auto_hide_main=False;self.auto_hide_tabs=False;self.auto_hide_tree=False;self.main_hide_delay=900;self.tree_hide_delay=900;self.right_controls_auto_hide=True;self.right_controls_hide_delay=500;self.favorite_organize_mode=False;self.favorites_navigation_root=None;self.favorite_return_group=None;self.recursive_search_enabled=False;self.recursive_search_results=None;self.recursive_search_result_query='';self.recursive_search_generation=0;self.recursive_search_jobs=[];self.google_lens_query='';self.disk_thumbnail_cache_limit_enabled=False;self.disk_thumbnail_cache_limit_mib=4096;self._disk_cache_trim_lock=threading.Lock();self._disk_cache_trim_future=None
-        self.current=Path.home();self.items=[];self.sort='name';self.desc=False;self.columns=5;self.thumb=260;self.mode='vertical';self.thumbnail_cache_enabled=True;self.thumbnail_cache_limit_mib=256;self.favorites=set();self.favorite_groups=[];self.active_favorite_group=None;self.tree_favorites=set();self.pinned_folders=set();self._pinned_folders_generation=0;self.pinned_thumbs={};self.pinned_folder_sizes={};self.pinned_folder_sizes_checked={};self.custom={};self.startup_folder=None;self.tabs=[];self.active_tab_index=-1;self.saved_tabs=[];self.saved_active_tab=0;self.scan_generation=0;self.scan_jobs=[];self.return_to_favorites=False;self.favorites_return_path=None;self.scroll_positions={};self._suppress_scroll_save=False;self.window_mode='fullscreen';self.last_deletion_undo=None;self.cache_dir=Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation));self.cache_dir.mkdir(parents=True,exist_ok=True);self.settings_file=self.cache_dir/'settings.json';self.install_dir=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else Path(__file__).resolve().parent;self.persistent_thumb_dir=self.install_dir/'thumbnail_cache';self.persistent_thumb_dir.mkdir(parents=True,exist_ok=True);self.load_settings();self.back_target=Path(self.startup_folder) if self.startup_folder else Path(self.current);self.image_search_provider='saucenao';self.image_search_mode=False;self.scan=None;self.work=None;self.build();self.grid.set_cache_limit_mib(self.thumbnail_cache_limit_mib);self.grid.persistent_folder_cache_dir=self.persistent_thumb_dir;self.grid.folder_cache.update(self.pinned_thumbs);self.grid.folder_size_cache.update(self.pinned_folder_sizes);self.grid.folder_size_cache_checked_at.update(self.pinned_folder_sizes_checked)
+        self.hover_details_enabled=True;self.hover_details_delay=500;self.hover_details_placement='top';self.slideshow_interval_ms=5000;self.wheel_scroll_rows=1;self.smooth_wheel_scroll=False;self._tab_drag_active=False;self.auto_hide_main=False;self.auto_hide_tabs=False;self.auto_hide_tree=False;self.main_hide_delay=900;self.tree_hide_delay=900;self.right_controls_auto_hide=True;self.right_controls_hide_delay=500;self.favorite_organize_mode=False;self.favorites_navigation_root=None;self.favorite_return_group=None;self.recursive_search_enabled=False;self.recursive_search_results=None;self.recursive_search_result_query='';self.recursive_search_generation=0;self.recursive_search_jobs=[];self.google_lens_query='';self.disk_thumbnail_cache_limit_enabled=False;self.disk_thumbnail_cache_limit_mib=4096;self._disk_cache_trim_lock=threading.Lock();self._disk_cache_trim_future=None
+        self.current=Path.home();self.items=[];self.sort='name';self.desc=False;self.columns=5;self.thumb=260;self.mode='vertical';self.thumbnail_cache_enabled=True;self.thumbnail_cache_limit_mib=256;self.favorites=set();self.favorite_groups=[];self.active_favorite_group=None;self.tree_favorites=set();self.tree_expanded_paths=set();self.tree_selected_path='';self.tree_scroll_value=0;self.tree_scroll_anchor_path='';self.tree_scroll_anchor_offset=0;self._tree_scroll_restore_pending=False;self.pinned_folders=set();self._pinned_folders_generation=0;self.pinned_thumbs={};self.pinned_folder_sizes={};self.pinned_folder_sizes_checked={};self.custom={};self.startup_folder=None;self.tabs=[];self.active_tab_index=-1;self.saved_tabs=[];self.saved_active_tab=0;self.scan_generation=0;self.scan_jobs=[];self.return_to_favorites=False;self.favorites_return_path=None;self.scroll_positions={};self.folder_sort_settings={};self.folder_manual_orders={};self.manual_order_created={};self._suppress_scroll_save=False;self.window_mode='fullscreen';self.last_deletion_undo=None;self.cache_dir=Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation));self.cache_dir.mkdir(parents=True,exist_ok=True);self.settings_file=self.cache_dir/'settings.json';self.install_dir=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else Path(__file__).resolve().parent;self.persistent_thumb_dir=self.install_dir/'thumbnail_cache';self.persistent_thumb_dir.mkdir(parents=True,exist_ok=True);self.load_settings();self.persistent_thumb_dir=Path(getattr(self,'thumbnail_cache_dir',self.persistent_thumb_dir));self.persistent_thumb_dir.mkdir(parents=True,exist_ok=True);self.back_target=Path(self.startup_folder) if self.startup_folder else Path(self.current);self.image_search_provider='saucenao';self.image_search_mode=False;self.scan=None;self.work=None;self.build();self.grid.set_cache_limit_mib(self.thumbnail_cache_limit_mib);self.grid.persistent_folder_cache_dir=self.persistent_thumb_dir;self.grid.folder_cache.update(self.pinned_thumbs);self.grid.folder_size_cache.update(self.pinned_folder_sizes);self.grid.folder_size_cache_checked_at.update(self.pinned_folder_sizes_checked)
+        self._folder_thumb_bridge=FolderThumbnailBridge(self);self._folder_thumb_bridge.completed.connect(self.handle_pinned_thumbnail_ready)
         self.restore_tabs()
         if self.disk_thumbnail_cache_limit_enabled:self.schedule_disk_thumbnail_cache_trim()
         for _pf in list(self.pinned_folders):
@@ -1748,23 +1982,23 @@ class Explorer(QMainWindow):
             if _cached:
                 self.pinned_thumbs[_pf]=_cached;self.grid.folder_cache[_pf]=_cached
             elif Path(_pf).is_dir():
-                _fut=self.grid.folder_pool.submit(self.grid.folder_image,_pf)
+                _fut=self.grid.folder_pool.submit(self.grid.resolve_folder_thumbnail,_pf)
                 def _warm_done(f,pp=_pf):
                     try:
                         _src=f.result()
-                        if _src:
-                            _cached2=self.grid.persist_folder_thumb(pp,_src)
-                            if _cached2:
-                                self.pinned_thumbs[pp]=_cached2;self.grid.folder_cache[pp]=_cached2;self.save_settings();self.schedule_disk_thumbnail_cache_trim()
-                    except Exception: pass
+                        if _src:self._folder_thumb_bridge.completed.emit(pp,_src)
+                    except Exception:
+                        if not f.cancelled():logger.exception('Could not warm pinned folder thumbnail for %s',pp)
                 _fut.add_done_callback(_warm_done)
         self.apply_window_state();self.apply_auto_hide()
     def load_settings(self):
         self.log_storage_mib=8
         configure_logging(self.cache_dir/'logs',self.log_storage_mib)
         try:
-            d=self._sanitize_settings(json.loads(self.settings_file.read_text()));self.favorites=set(d.get('favorites',[]));self.favorite_groups=d.get('favorite_groups',[]);self.tree_favorites=set(d.get('tree_favorites',[]));self.custom=d.get('custom',{});self.pinned_folders=set(d.get('pinned_folders',[]));self._pinned_folders_generation+=1;self.pinned_thumbs=d.get('pinned_thumbs',{});self.pinned_folder_sizes=d.get('pinned_folder_sizes',{});self.pinned_folder_sizes_checked=d.get('pinned_folder_sizes_checked',{});self.image_search_provider=d.get('image_search_provider','saucenao');self.saucenao_api_key=d.get('saucenao_api_key','');self.window_mode=d.get('window_mode','fullscreen');self.saved_geometry=d.get('geometry');self.hover_details_enabled=bool(d.get('hover_details_enabled',True));self.hover_details_delay=max(0,min(3000,int(d.get('hover_details_delay',500))));_placement=d.get('hover_details_placement','top');self.hover_details_placement='bottom' if _placement=='below' else (_placement if _placement in ('top','bottom','above') else 'top');self.thumbnail_cache_enabled=bool(d.get('thumbnail_cache_enabled',True));self.thumbnail_cache_limit_mib=max(16,min(8192,int(d.get('thumbnail_cache_limit_mib',256))));self.auto_hide_main=bool(d.get('auto_hide_main',False));self.auto_hide_tabs=bool(d.get('auto_hide_tabs',False));self.auto_hide_tree=bool(d.get('auto_hide_tree',False));self.main_hide_delay=max(0,min(10000,int(d.get('main_hide_delay',900))));self.tree_hide_delay=max(0,min(10000,int(d.get('tree_hide_delay',900))));self.has_saved_tabs='tabs' in d;self.saved_tabs=d.get('tabs',[]);self.saved_active_tab=max(0,int(d.get('active_tab',0)))
+            d=self._sanitize_settings(json.loads(self.settings_file.read_text()));self.favorites=set(d.get('favorites',[]));self.favorite_groups=d.get('favorite_groups',[]);self.tree_favorites=set(d.get('tree_favorites',[]));self.tree_expanded_paths=set(d.get('tree_expanded_paths',[]));self.tree_selected_path=d.get('tree_selected_path','');self.tree_scroll_value=d.get('tree_scroll_value',0);self.tree_scroll_anchor_path=d.get('tree_scroll_anchor_path','');self.tree_scroll_anchor_offset=d.get('tree_scroll_anchor_offset',0);self.custom=d.get('custom',{});self.pinned_folders=set(d.get('pinned_folders',[]));self._pinned_folders_generation+=1;self.pinned_thumbs=d.get('pinned_thumbs',{});self.pinned_folder_sizes=d.get('pinned_folder_sizes',{});self.pinned_folder_sizes_checked=d.get('pinned_folder_sizes_checked',{});self.image_search_provider=d.get('image_search_provider','saucenao');self.saucenao_api_key=d.get('saucenao_api_key','');self.window_mode=d.get('window_mode','fullscreen');self.saved_geometry=d.get('geometry');self.hover_details_enabled=bool(d.get('hover_details_enabled',True));self.hover_details_delay=max(0,min(3000,int(d.get('hover_details_delay',500))));_placement=d.get('hover_details_placement','top');self.hover_details_placement='bottom' if _placement=='below' else (_placement if _placement in ('top','bottom','above') else 'top');self.thumbnail_cache_enabled=bool(d.get('thumbnail_cache_enabled',True));self.thumbnail_cache_limit_mib=max(16,min(8192,int(d.get('thumbnail_cache_limit_mib',256))));self.auto_hide_main=bool(d.get('auto_hide_main',False));self.auto_hide_tabs=bool(d.get('auto_hide_tabs',False));self.auto_hide_tree=bool(d.get('auto_hide_tree',False));self.main_hide_delay=max(0,min(10000,int(d.get('main_hide_delay',900))));self.tree_hide_delay=max(0,min(10000,int(d.get('tree_hide_delay',900))));self.has_saved_tabs='tabs' in d;self.saved_tabs=d.get('tabs',[]);self.saved_active_tab=max(0,int(d.get('active_tab',0)));self.folder_sort_settings=d.get('folder_sort_settings',{});self.folder_manual_orders=d.get('folder_manual_orders',{});self.manual_order_created=d.get('manual_order_created',{});self.thumbnail_cache_dir=d.get('thumbnail_cache_dir') or str(self.persistent_thumb_dir)
             self.slideshow_interval_ms=max(250,min(60000,int(d.get('slideshow_interval_ms',5000))))
+            self.wheel_scroll_rows=max(.1,min(12.0,float(d.get('wheel_scroll_rows',1))))
+            self.smooth_wheel_scroll=bool(d.get('smooth_wheel_scroll',False))
             self.log_storage_mib=max(1,min(64,int(d.get('log_storage_mib',8))))
             self.recursive_search_enabled=bool(d.get('recursive_search_enabled',False))
             self.google_lens_query=d.get('google_lens_query','') if isinstance(d.get('google_lens_query',''),str) else ''
@@ -1824,7 +2058,7 @@ class Explorer(QMainWindow):
             for tab in tabs:
                 if not isinstance(tab,dict) or not isinstance(tab.get('path'),str) or not tab['path'].strip():continue
                 tab['kind']=tab.get('kind') if tab.get('kind') in ('folder','farview') else 'folder'
-                tab['sort']=tab.get('sort') if tab.get('sort') in ('name','mtime','ctime','type','size','random') else 'name'
+                tab['sort']=tab.get('sort') if tab.get('sort') in ('name','mtime','ctime','type','size','random','manual') else 'name'
                 tab['desc']=bool(tab.get('desc',False));tab['unsorted']=bool(tab.get('unsorted',True))
                 color=tab.get('color','')
                 tab['color']=color if isinstance(color,str) and re.fullmatch(r'#[0-9a-fA-F]{6}',color) else ''
@@ -1838,25 +2072,63 @@ class Explorer(QMainWindow):
                         except (TypeError,ValueError,OverflowError):continue
                 tab['positions']=clean_positions
                 selection=tab.get('selection',[]);tab['selection']=[path for path in selection if isinstance(path,str)] if isinstance(selection,list) else []
+                source_order=tab.get('source_order',[]);tab['source_order']=[path for path in source_order if isinstance(path,str)][:100000] if isinstance(source_order,list) else []
+                tab['view_id']=str(tab.get('view_id') or '')[:64]
                 clean_tabs.append(tab)
         data['tabs']=clean_tabs
+        folder_sorts=data.get('folder_sort_settings',{});clean_folder_sorts={}
+        if isinstance(folder_sorts,dict):
+            for folder,value in folder_sorts.items():
+                if not isinstance(folder,str) or not folder.strip() or not isinstance(value,dict):continue
+                sort=value.get('sort')
+                if sort not in ('name','mtime','ctime','type','size','random','manual'):continue
+                key=os.path.normcase(os.path.normpath(os.path.abspath(folder)))
+                clean_folder_sorts[key]={'sort':sort,'desc':bool(value.get('desc',False))}
+                if len(clean_folder_sorts)>5000:clean_folder_sorts.pop(next(iter(clean_folder_sorts)))
+        data['folder_sort_settings']=clean_folder_sorts
+        manual_orders=data.get('folder_manual_orders',{});clean_manual_orders={}
+        if isinstance(manual_orders,dict):
+            for key,order in manual_orders.items():
+                if isinstance(key,str) and key and isinstance(order,list):clean_manual_orders[key]=[v for v in order[:100000] if isinstance(v,str)]
+        data['folder_manual_orders']=clean_manual_orders
+        created=data.get('manual_order_created',{});clean_created={}
+        if isinstance(created,dict):
+            for key,value in created.items():
+                if not isinstance(key,str) or isinstance(value,bool):continue
+                try:stamp=float(value)
+                except (TypeError,ValueError,OverflowError):continue
+                if 0<=stamp<1e12:clean_created[key]=stamp
+        data['manual_order_created']=clean_created
+        data['tree_expanded_paths']=string_list('tree_expanded_paths')[:10000]
+        selected_tree=data.get('tree_selected_path','')
+        data['tree_selected_path']=selected_tree if isinstance(selected_tree,str) else ''
+        try:data['tree_scroll_value']=max(0,int(data.get('tree_scroll_value',0)))
+        except (TypeError,ValueError,OverflowError):data['tree_scroll_value']=0
+        anchor=data.get('tree_scroll_anchor_path','');data['tree_scroll_anchor_path']=anchor if isinstance(anchor,str) else ''
+        try:data['tree_scroll_anchor_offset']=int(data.get('tree_scroll_anchor_offset',0))
+        except (TypeError,ValueError,OverflowError):data['tree_scroll_anchor_offset']=0
+        cache_path=data.get('thumbnail_cache_dir')
+        data['thumbnail_cache_dir']=cache_path if isinstance(cache_path,str) and cache_path.strip() else ''
         for key in ('startup','last','geometry','saucenao_api_key','google_lens_query'):
             if data.get(key) is not None and not isinstance(data.get(key),str):data[key]=None if key not in ('saucenao_api_key','google_lens_query') else ''
         for key,default in {'active_tab':0,'hover_details_delay':500,'thumbnail_cache_limit_mib':256,'disk_thumbnail_cache_limit_mib':4096,'main_hide_delay':900,'tree_hide_delay':900,'slideshow_interval_ms':5000,'log_storage_mib':8,'right_controls_hide_delay':500}.items():
             try:data[key]=int(data.get(key,default))
             except (TypeError,ValueError,OverflowError):data[key]=default
-        for key,default in {'hover_details_enabled':True,'thumbnail_cache_enabled':True,'disk_thumbnail_cache_limit_enabled':False,'auto_hide_main':False,'auto_hide_tabs':False,'auto_hide_tree':False,'right_controls_auto_hide':True,'recursive_search_enabled':False}.items():
+        for key,default in {'hover_details_enabled':True,'thumbnail_cache_enabled':True,'disk_thumbnail_cache_limit_enabled':False,'auto_hide_main':False,'auto_hide_tabs':False,'auto_hide_tree':False,'right_controls_auto_hide':True,'recursive_search_enabled':False,'smooth_wheel_scroll':False}.items():
             data[key]=data.get(key,default) if isinstance(data.get(key,default),bool) else default
+        try:data['wheel_scroll_rows']=max(.1,min(12.0,float(data.get('wheel_scroll_rows',1))))
+        except (TypeError,ValueError,OverflowError):data['wheel_scroll_rows']=1.0
         if data.get('window_mode') not in ('fullscreen','maximized','normal'):data['window_mode']='fullscreen'
         return data
     def save_settings(self):
         geometry=None
         try:
             geometry=bytes(self.saveGeometry().toBase64()).decode('ascii')
-        except: pass
-        tabs=[{k:v for k,v in tab.items() if k in ('path','kind','scroll','positions','sort','desc','unsorted','selection','color')} for tab in getattr(self,'tabs',[])]
+        except (RuntimeError,ValueError):
+            logger.debug('Could not save window geometry',exc_info=True)
+        tabs=[{k:v for k,v in tab.items() if k in ('path','kind','scroll','positions','sort','desc','unsorted','selection','color','source_order','view_id')} for tab in getattr(self,'tabs',[])]
         payload=json.dumps({'favorites':list(self.favorites),'favorite_groups':self.favorite_groups,'tree_favorites':list(self.tree_favorites),'pinned_folders':list(self.pinned_folders),'pinned_thumbs':self.pinned_thumbs,'pinned_folder_sizes':self.pinned_folder_sizes,'pinned_folder_sizes_checked':self.pinned_folder_sizes_checked,'custom':self.custom,'image_search_provider':self.image_search_provider,'saucenao_api_key':getattr(self,'saucenao_api_key',''),'hover_details_enabled':self.hover_details_enabled,'hover_details_delay':self.hover_details_delay,'hover_details_placement':self.hover_details_placement,'thumbnail_cache_enabled':self.thumbnail_cache_enabled,'thumbnail_cache_limit_mib':self.thumbnail_cache_limit_mib,'auto_hide_main':getattr(self,'auto_hide_main',False),'auto_hide_tabs':getattr(self,'auto_hide_tabs',False),'auto_hide_tree':getattr(self,'auto_hide_tree',False),'main_hide_delay':getattr(self,'main_hide_delay',900),'tree_hide_delay':getattr(self,'tree_hide_delay',900),'last':str(self.current),'startup':self.startup_folder,'window_mode':self.window_mode,'geometry':geometry,'tabs':tabs,'active_tab':max(0,self.current_tab_index()) if hasattr(self,'tabbar') else 0})
-        payload=json.dumps(json.loads(payload)|{'slideshow_interval_ms':self.slideshow_interval_ms,'right_controls_auto_hide':self.right_controls_auto_hide,'right_controls_hide_delay':self.right_controls_hide_delay,'log_storage_mib':self.log_storage_mib,'recursive_search_enabled':self.recursive_search_enabled,'google_lens_query':getattr(self,'google_lens_query',''),'disk_thumbnail_cache_limit_enabled':self.disk_thumbnail_cache_limit_enabled,'disk_thumbnail_cache_limit_mib':self.disk_thumbnail_cache_limit_mib})
+        payload=json.dumps(json.loads(payload)|{'slideshow_interval_ms':self.slideshow_interval_ms,'wheel_scroll_rows':self.wheel_scroll_rows,'smooth_wheel_scroll':self.smooth_wheel_scroll,'right_controls_auto_hide':self.right_controls_auto_hide,'right_controls_hide_delay':self.right_controls_hide_delay,'log_storage_mib':self.log_storage_mib,'recursive_search_enabled':self.recursive_search_enabled,'folder_sort_settings':self.folder_sort_settings,'folder_manual_orders':self.folder_manual_orders,'manual_order_created':self.manual_order_created,'tree_expanded_paths':sorted(self.tree_expanded_paths),'tree_selected_path':self.tree_selected_path,'tree_scroll_value':self.tree_scroll_value,'tree_scroll_anchor_path':getattr(self,'tree_scroll_anchor_path',''),'tree_scroll_anchor_offset':getattr(self,'tree_scroll_anchor_offset',0),'thumbnail_cache_dir':str(self.persistent_thumb_dir),'google_lens_query':getattr(self,'google_lens_query',''),'disk_thumbnail_cache_limit_enabled':self.disk_thumbnail_cache_limit_enabled,'disk_thumbnail_cache_limit_mib':self.disk_thumbnail_cache_limit_mib})
         try:
             self.settings_file.parent.mkdir(parents=True,exist_ok=True)
             tmp=self.settings_file.with_suffix('.tmp')
@@ -1876,6 +2148,16 @@ class Explorer(QMainWindow):
         dlg=QDialog(self);dlg.setWindowTitle('Slideshow');layout=QVBoxLayout(dlg);row=QHBoxLayout();row.addWidget(QLabel('Time per image'));interval=QSpinBox();interval.setRange(250,60000);interval.setSingleStep(250);interval.setSuffix(' ms');interval.setValue(self.slideshow_interval_ms);row.addWidget(interval);layout.addLayout(row)
         note=QLabel('The viewer advances to the next image at this interval while the slideshow button is active.');note.setWordWrap(True);layout.addWidget(note);buttons=QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel);buttons.accepted.connect(dlg.accept);buttons.rejected.connect(dlg.reject);layout.addWidget(buttons)
         if dlg.exec()==QDialog.Accepted:self.slideshow_interval_ms=interval.value();self.save_settings()
+    def configure_scroll_behavior(self):
+        dlg=QDialog(self);dlg.setWindowTitle('Scroll behavior');layout=QVBoxLayout(dlg)
+        row=QHBoxLayout();row.addWidget(QLabel('Rows per mouse-wheel notch'));rows=QDoubleSpinBox();rows.setRange(.1,12);rows.setSingleStep(.1);rows.setDecimals(1);rows.setSuffix(' rows');rows.setValue(self.wheel_scroll_rows);row.addWidget(rows);layout.addLayout(row)
+        smooth=QCheckBox('Smooth scrolling with gentle momentum');smooth.setChecked(self.smooth_wheel_scroll);layout.addWidget(smooth)
+        note=QLabel('Smooth scrolling eases to a stop and may travel slightly past the first wheel step.');note.setWordWrap(True);layout.addWidget(note)
+        buttons=QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel);buttons.accepted.connect(dlg.accept);buttons.rejected.connect(dlg.reject);layout.addWidget(buttons)
+        if dlg.exec()==QDialog.Accepted:
+            self.wheel_scroll_rows=rows.value();self.smooth_wheel_scroll=smooth.isChecked()
+            if not self.smooth_wheel_scroll:self.grid.stop_smooth_scroll()
+            self.save_settings()
     def configure_right_controls(self):
         dlg=QDialog(self);dlg.setWindowTitle('Right-side buttons');layout=QVBoxLayout(dlg)
         hide=QCheckBox('Hide right-side buttons until the pointer reaches the right edge');hide.setChecked(self.right_controls_auto_hide);layout.addWidget(hide)
@@ -1934,6 +2216,14 @@ class Explorer(QMainWindow):
         self.root_widget.update()
     def check_titlebar_hover(self):
         if not self.auto_hide_main or not hasattr(self,'main_bar') or isinstance(QApplication.activeWindow(),MediaViewer):return
+        if getattr(self,'shift_selection_held',False):
+            self.main_hide_timer.stop()
+            if self.main_bar.isVisible():self.set_main_panel_visible(False)
+            return
+        if QApplication.focusWidget() is getattr(self,'search',None):
+            self.main_hide_timer.stop()
+            if not self.main_bar.isVisible():self.set_main_panel_visible(True)
+            return
         cursor=QCursor.pos();frame=self.frameGeometry();client=self.geometry()
         in_titlebar=frame.contains(cursor) and cursor.y()<client.top() and not client.contains(cursor)
         if in_titlebar:
@@ -1943,15 +2233,20 @@ class Explorer(QMainWindow):
             if getattr(self,'tab_context_menu_open',False):
                 self.main_hide_timer.stop();return
             pos=self.root_widget.mapFromGlobal(cursor)
-            over_panel=self.main_bar.geometry().contains(pos) or (self.auto_hide_tabs and self.nav_bar.geometry().contains(pos))
+            over_panel=self.main_bar.geometry().contains(pos) or (self.nav_bar.isVisible() and self.nav_bar.geometry().contains(pos))
             over_menu=any(action.menu() and action.menu().isVisible() and action.menu().geometry().contains(cursor) for action in self.menu_bar.actions()) if hasattr(self,'menu_bar') else False
             if over_panel or over_menu:self.main_hide_timer.stop()
             elif not self.main_hide_timer.isActive():self.main_hide_timer.start(self.main_hide_delay)
     def hide_tree_overlay(self):
-        if self.auto_hide_tree and hasattr(self,'tree_dock'):self.tree_dock.hide()
+        if self.auto_hide_tree and hasattr(self,'tree_dock'):
+            if getattr(self,'tree_scrollbar_interacting',False) or self.tree_panel_contains_global(QCursor.pos()):
+                self.tree_hide_timer.stop();return
+            self.save_tree_navigation_state()
+            self.tree_dock.hide()
     def hide_main_panel(self):
-        if getattr(self,'tab_context_menu_open',False):return
+        if getattr(self,'tab_context_menu_open',False) or getattr(self,'_tab_drag_active',False):return
         if getattr(self,'tab_reveal_timer',None) and self.tab_reveal_timer.isActive():return
+        if QApplication.focusWidget() is getattr(self,'search',None):return
         if hasattr(self,'menu_bar'):
             for action in self.menu_bar.actions():
                 menu=action.menu()
@@ -1983,14 +2278,30 @@ class Explorer(QMainWindow):
         if not menu.isVisible():menu.popup(self.menu_bar.mapToGlobal(self.menu_bar.actionGeometry(action).bottomLeft()))
     def eventFilter(self,obj,event):
         viewer_active=isinstance(QApplication.activeWindow(),MediaViewer)
-        if event.type()==QEvent.KeyPress and event.key()==Qt.Key_Control and QApplication.activeWindow() is self and self.in_favorites_view and not event.isAutoRepeat():
-            self.set_favorite_organization_mode(True)
-        elif event.type()==QEvent.KeyRelease and event.key()==Qt.Key_Control and self.in_favorites_view and self.favorite_organize_mode and not event.isAutoRepeat():
-            self.set_favorite_organization_mode(False)
+        active=QApplication.activeWindow();main_active=active is self or (active is not None and self.isAncestorOf(active));target_main=obj is self or (isinstance(obj,QWidget) and self.isAncestorOf(obj))
+        if hasattr(self,'file_tree') and obj in (self.file_tree,self.file_tree.viewport()) and event.type() in (QEvent.Wheel,QEvent.MouseButtonPress,QEvent.KeyPress):
+            if self._tree_scroll_restore_pending and not self._tree_restoring_scroll:
+                # Once the user interacts with the visible tree, its saved view
+                # is authoritative; a delayed async restore must not jump it.
+                self._tree_scroll_restore_pending=False;self._tree_rebuilding=False
+        if event.type()==QEvent.ApplicationDeactivate:
+            self.ctrl_key_down=False;self.ctrl_organization_timer.stop()
+            if self.ctrl_organization_held:self.ctrl_organization_held=False;self.set_favorite_organization_mode(False)
+        if event.type()==QEvent.KeyPress and event.key()==Qt.Key_Control and (main_active or target_main) and not event.isAutoRepeat():
+            self.ctrl_key_down=True;self.ctrl_organization_timer.start()
+        elif event.type()==QEvent.KeyRelease and event.key()==Qt.Key_Control:
+            self.ctrl_key_down=False
+            self.ctrl_organization_timer.stop()
+            if self.ctrl_organization_held:self.ctrl_organization_held=False;self.set_favorite_organization_mode(False)
+        elif event.type()==QEvent.KeyPress and event.modifiers()&Qt.ControlModifier:
+            self.ctrl_organization_timer.stop()
+        if event.type()==QEvent.MouseButtonPress and event.button()==Qt.LeftButton and self.ctrl_key_down and obj is getattr(getattr(self,'grid',None),'viewport',lambda:None)():
+            self.ctrl_organization_timer.stop();self.set_favorite_organization_mode(True);self.ctrl_organization_held=True
         if event.type()==QEvent.MouseMove and not viewer_active and hasattr(self,'grid') and self.grid.navigation_index>=0:
             self.grid.navigation_index=-1;self.grid.viewport().update()
         if event.type()==QEvent.KeyPress and QApplication.activeWindow() is self and not viewer_active:
             focus=QApplication.focusWidget();editing=isinstance(focus,(QLineEdit,QSpinBox))
+            if not editing and event.key()==Qt.Key_A and event.modifiers()&Qt.ControlModifier:self.grid.select_all_current();event.accept();return True
             if not editing and event.key()==Qt.Key_Delete:
                 if event.modifiers()&Qt.ShiftModifier:
                     self.send_paths_to_trash(list(self.grid.selected_paths))
@@ -2007,13 +2318,14 @@ class Explorer(QMainWindow):
             if not editing and Qt.Key_1<=event.key()<=Qt.Key_6 and not event.modifiers()&(Qt.ControlModifier|Qt.AltModifier|Qt.ShiftModifier):self.set_sort(('name','mtime','ctime','type','size','random')[event.key()-Qt.Key_1]);event.accept();return True
         if event.type()==QEvent.KeyPress and event.key()==Qt.Key_Shift:
             self.shift_selection_held=True
-            if self.auto_hide_main:self.main_hide_timer.stop();self.hide_main_panel()
+            if self.auto_hide_main:self.main_hide_timer.stop();self.tab_reveal_timer.stop();self.set_main_panel_visible(False)
             if self.auto_hide_tree:self.tree_hide_timer.stop();self.hide_tree_overlay()
             if hasattr(self,'favorite_group_overlay'):self.hide_favorite_controls()
         elif event.type()==QEvent.KeyRelease and event.key()==Qt.Key_Shift:self.shift_selection_held=False
         if viewer_active:
             if self.auto_hide_main:self.set_main_panel_visible(False)
-            if self.auto_hide_tree and hasattr(self,'tree_dock'):self.tree_dock.hide()
+            if self.auto_hide_tree and hasattr(self,'tree_dock'):
+                self.save_tree_navigation_state();self.tree_dock.hide()
             if hasattr(self,'favorite_group_overlay'):self.hide_favorite_controls()
         if event.type()==QEvent.Resize and obj is getattr(self,'root_widget',None):
             if self.auto_hide_main:self.main_bar.setGeometry(0,0,self.root_widget.width(),self.main_bar.sizeHint().height())
@@ -2038,14 +2350,21 @@ class Explorer(QMainWindow):
             pos=self.root_widget.mapFromGlobal(QCursor.pos())
             if self.auto_hide_main:
                 over_tabs=self.nav_bar.isVisible() and self.nav_bar.geometry().contains(pos)
-                if pos.y()<=2:
+                if QApplication.focusWidget() is getattr(self,'search',None):
+                    self.main_hide_timer.stop()
+                    if not self.main_bar.isVisible():self.set_main_panel_visible(True)
+                elif pos.y()<=2:
                     self.main_hide_timer.stop();self.set_main_panel_visible(True)
                 elif over_tabs or main_menu_hover or getattr(self,'tab_context_menu_open',False):self.main_hide_timer.stop()
                 elif self.main_bar.isVisible() and pos.y()>self.main_bar.height():self.main_hide_timer.start(self.main_hide_delay)
             if self.auto_hide_tree and hasattr(self,'tree_dock'):
-                if 0<=pos.x()<=10:
+                if getattr(self,'tree_scrollbar_interacting',False):
+                    self.tree_hide_timer.stop()
+                elif self.tree_panel_contains_global(QCursor.pos()):
+                    self.tree_hide_timer.stop()
+                elif 0<=pos.x()<=10:
                     self.show_tree_overlay()
-                elif self.tree_dock.isVisible() and not QRect(0,0,300,self.root_widget.height()).contains(pos):self.tree_hide_timer.start(self.tree_hide_delay)
+                elif self.tree_dock.isVisible() and not self.tree_hide_timer.isActive():self.tree_hide_timer.start(self.tree_hide_delay)
         if event.type()==QEvent.MouseMove and hasattr(self,'selection_clear_overlay') and not viewer_active:
             pos=self.root_widget.mapFromGlobal(QCursor.pos());self.position_right_controls()
             rects=[w.geometry().adjusted(-3,-3,3,3) for w in self.right_control_widgets() if w.isVisible()]
@@ -2061,7 +2380,8 @@ class Explorer(QMainWindow):
             if self.saved_geometry:
                 from PySide6.QtCore import QByteArray
                 self.restoreGeometry(QByteArray.fromBase64(self.saved_geometry.encode('ascii')))
-        except: pass
+        except Exception:
+            logger.warning('Could not restore saved window geometry',exc_info=True)
         if self.window_mode=='fullscreen': self.showFullScreen()
         elif self.window_mode=='maximized': self.showMaximized()
         else: self.showNormal()
@@ -2086,7 +2406,9 @@ class Explorer(QMainWindow):
             if job.isRunning():job.requestInterruption()
         for job in list(getattr(self,'recursive_search_jobs',[])):
             if job.isRunning():job.wait(250)
-        if hasattr(self,'_tree_generation'):self._tree_generation+=1
+        if hasattr(self,'_tree_generation'):
+            if hasattr(self,'tree_scroll_save_timer'):self.tree_scroll_save_timer.stop()
+            self.save_tree_navigation_state();self._tree_generation+=1
         TREE_SCAN_POOL.shutdown(wait=False,cancel_futures=True)
         menu=getattr(self,'favorite_picker_menu',None)
         if menu is not None:menu.close()
@@ -2107,6 +2429,7 @@ class Explorer(QMainWindow):
         if app is not None:QTimer.singleShot(0,app.quit)
     def resizeEvent(self,e):
         super().resizeEvent(e)
+        self.position_activity_overlay()
         if self.auto_hide_main and hasattr(self,'root_widget') and hasattr(self,'main_bar'):
             self.set_main_panel_visible(self.main_bar.isVisible())
     def build(self):
@@ -2114,10 +2437,11 @@ class Explorer(QMainWindow):
         mb=QMenuBar();mb.setMouseTracking(True);mb.hovered.connect(self.open_menu_on_hover);self.menu_bar=mb
         for title in ('FILES','VIEW','PERFORMANCE','TOOLS','HELP'):
             m=mb.addMenu(title)
-            if title=='FILES':m.addAction('Open folder…',self.choose);m.addAction('Refresh',lambda:self.load(self.current,restore_scroll=True));m.addSeparator();m.addAction('Exit',self.close)
+            if title=='FILES':m.addAction('Open folder…',self.choose);m.addAction('Refresh',self.refresh_current_view);m.addSeparator();m.addAction('Exit',self.close)
             if title=='VIEW':
                 m.addAction('Vertical grid',lambda checked=False:self.set_mode('vertical'));m.addAction('Horizontal rows',lambda checked=False:self.set_mode('horizontal'));m.addSeparator()
                 m.addAction('Thumbnail hover settings…',self.configure_hover_details);m.addAction('Slideshow timer…',self.configure_slideshow);m.addAction('Auto-hide panels…',self.configure_auto_hide);m.addAction('Right-side buttons…',self.configure_right_controls)
+                m.addAction('Manage personal orders…',self.manage_personal_orders)
             if title=='PERFORMANCE':
                 recursive_action=m.addAction('Recursive search in subfolders');recursive_action.setCheckable(True);recursive_action.setChecked(self.recursive_search_enabled);recursive_action.toggled.connect(self.set_recursive_search_enabled)
                 m.addSeparator()
@@ -2125,16 +2449,17 @@ class Explorer(QMainWindow):
                 self.thumbnail_cache_limit_action=m.addAction(f'Memory thumbnail cache limit… ({self.thumbnail_cache_limit_mib} MiB)');self.thumbnail_cache_limit_action.triggered.connect(self.configure_thumbnail_cache_limit)
                 self.disk_thumbnail_cache_action=m.addAction('Limit on-disk thumbnail cache');self.disk_thumbnail_cache_action.setCheckable(True);self.disk_thumbnail_cache_action.setChecked(self.disk_thumbnail_cache_limit_enabled);self.disk_thumbnail_cache_action.toggled.connect(self.set_disk_thumbnail_cache_limit_enabled)
                 self.disk_thumbnail_cache_limit_action=m.addAction(f'On-disk thumbnail cache limit… ({self.disk_thumbnail_cache_limit_mib} MiB)');self.disk_thumbnail_cache_limit_action.triggered.connect(self.configure_disk_thumbnail_cache_limit)
+                m.addAction('Thumbnail cache location…',self.configure_thumbnail_cache_location)
                 self.log_storage_action=m.addAction(f'Maximum log storage… ({self.log_storage_mib} MiB)');self.log_storage_action.triggered.connect(self.configure_log_storage_limit)
                 m.addAction('Keep folder thumbnails…',self.manage_pinned_folders)
-            if title=='TOOLS':m.addAction('Set custom folder thumbnail…',self.set_custom);m.addSeparator();m.addAction('Set startup folder…',self.set_startup);m.addAction('Use last folder on startup',self.clear_startup);m.addSeparator();m.addAction('Reverse image search…',self.choose_search_provider);m.addAction('Google Lens text query…',self.configure_google_lens_query);m.addAction('Set SauceNAO API key…',self.set_saucenao_api_key)
+            if title=='TOOLS':m.addAction('Set custom folder thumbnail…',self.set_custom);m.addSeparator();m.addAction('Scroll behavior…',self.configure_scroll_behavior);m.addSeparator();m.addAction('Set startup folder…',self.set_startup);m.addAction('Use last folder on startup',self.clear_startup);m.addSeparator();m.addAction('Reverse image search…',self.choose_search_provider);m.addAction('Google Lens text query…',self.configure_google_lens_query);m.addAction('Set SauceNAO API key…',self.set_saucenao_api_key)
             if title=='HELP':m.addAction('Keyboard and mouse controls…',self.show_controls_help)
         top=QFrame();top.setObjectName('top');top_layout=QVBoxLayout(top);top_layout.setContentsMargins(0,0,0,0);top_layout.setSpacing(0);top_layout.addWidget(mb);controls=QWidget(top);tl=QHBoxLayout(controls);tl.setContentsMargins(12,5,12,7);tl.setSpacing(7);top_layout.addWidget(controls)
-        for s,t,f in [('☰','File tree',self.toggle_file_tree),('⌂','Back',self.back),('↑','Up',self.up),('⟳','Refresh',lambda:self.load(self.current))]:
+        for s,t,f in [('☰','File tree',self.toggle_file_tree),('⌂','Back',self.back),('↑','Up',self.up),('⟳','Refresh',self.refresh_current_view)]:
             button=self.addbtn(tl,s,t,f)
             if t=='Back':self.backbtn=button;self.set_button_asset(button,'back.png')
         self.addbtn(tl,'⌕','Image search',self.toggle_image_search)
-        self.favorites_list_btn=self.addbtn(tl,'☆','Show favorite folders',self.show_favorites)
+        self.favorites_list_btn=self.addbtn(tl,'☆','Show favorite folders',self.toggle_favorites_view)
         self.farviewbtn=self.addbtn(tl,'⇢','Create a Farview tab from this folder and its image subfolders',self.create_farview)
         self.set_button_asset(self.farviewbtn,'eye.png')
         self.recursive_search_timer=QTimer(self);self.recursive_search_timer.setSingleShot(True);self.recursive_search_timer.setInterval(250);self.recursive_search_timer.timeout.connect(self.start_recursive_search)
@@ -2143,7 +2468,7 @@ class Explorer(QMainWindow):
         tl.addStretch(1)
         sb=QHBoxLayout();lab=QLabel('Sorting');lab.setObjectName('section');lab.setAlignment(Qt.AlignVCenter|Qt.AlignRight);sb.addWidget(lab);sr=QHBoxLayout()
         self.sortBtns={}
-        for k,s,t in [('name','☷','Name'),('mtime','◩','Last modified'),('ctime','◷','Last created'),('type','◇','Type'),('size','◴','Size'),('random','⤨','Random folders')]:
+        for k,s,t in [('name','☷','Name'),('mtime','◩','Last modified'),('ctime','◷','Last created'),('type','◇','Type'),('size','◴','Size'),('random','⤨','Random folders'),('manual','↕','Personal order')]:
             q=self.addbtn(sr,s,t,lambda checked=False,k=k:self.set_sort(k),'sort');q.setCheckable(True);self.sortBtns[k]=q
             q.setToolButtonStyle(Qt.ToolButtonIconOnly);q.setMinimumWidth(56);q.setIconSize(QSize(46,24))
         for key,filename in {'name':'list.png','mtime':'lastmod.png','type':'types.png','size':'size.png'}.items():self.set_button_asset(self.sortBtns[key],filename)
@@ -2154,21 +2479,24 @@ class Explorer(QMainWindow):
         self.windowbtn=self.addbtn(tl,'⛶','Full screen',self.toggle_fullscreen);self.main_bar=top;main.addWidget(top);line=QFrame();line.setObjectName('line');main.addWidget(line);self.main_bar_line=line;self.main_bar_layout=main
         nav=QFrame();nav.setObjectName('navigation');nav.setAttribute(Qt.WA_StyledBackground,True);self.nav_bar=nav;nl=QHBoxLayout(nav);nl.setContentsMargins(14,4,14,4);nl.setSpacing(8)
         self.crumb=QLabel();self.crumb.setObjectName('crumb');self.crumb.setFixedWidth(360);self.crumb.setTextInteractionFlags(Qt.TextSelectableByMouse);self.crumb.setCursor(Qt.PointingHandCursor);self.crumb.mousePressEvent=lambda e:self.reveal(self.current) if e.button()==Qt.LeftButton else None;nl.addWidget(self.crumb)
-        self.tabbar=SafeTabBar();self.tabbar.setExpanding(False);self.tabbar.setMovable(False);self.tabbar.setTabsClosable(False);self.tabbar.closeRequested.connect(self.close_tab);self.tabbar.setDocumentMode(True);self.tabbar.setElideMode(Qt.ElideMiddle);self.tabbar.currentChanged.connect(self.switch_tab);self.tabbar.setMinimumWidth(300);nl.addWidget(self.tabbar,1)
+        self.tabbar=SafeTabBar();self.tabbar.setExpanding(False);self.tabbar.setMovable(False);self.tabbar.setTabsClosable(False);self.tabbar.closeRequested.connect(self.close_tab);self.tabbar.dragStarted.connect(self.begin_tab_drag);self.tabbar.dragFinished.connect(self.end_tab_drag);self.tabbar.tabMoved.connect(self.tab_reordered);self.tabbar.setDocumentMode(True);self.tabbar.setElideMode(Qt.ElideMiddle);self.tabbar.currentChanged.connect(self.switch_tab);self.tabbar.setMinimumWidth(300);nl.addWidget(self.tabbar,1)
         self.status=MarqueeLabel();self.status.setObjectName('status');self.status.setFixedWidth(190);self.status.setAlignment(Qt.AlignRight|Qt.AlignVCenter);nl.addWidget(self.status)
         main.addWidget(nav)
         self.grid=VirtualGrid(self);self.grid.openItem.connect(self.open);self.grid.toggleItemFavorite.connect(self.toggle_item_favorite)
         self.grid.imageSearchRequested.connect(self.perform_image_search);self.grid.middleOpenItem.connect(self.open_new_tab);self.grid.goBack.connect(self.up);self.grid.verticalScrollBar().valueChanged.connect(self.remember_scroll);main.addWidget(self.grid,1)
-        self.root_widget=root;root.setMouseTracking(True);QApplication.instance().installEventFilter(self);self.main_hide_timer=QTimer(self);self.main_hide_timer.setSingleShot(True);self.main_hide_timer.timeout.connect(self.hide_main_panel);self.tab_reveal_timer=QTimer(self);self.tab_reveal_timer.setSingleShot(True);self.tab_reveal_timer.setInterval(2000);self.tab_reveal_timer.timeout.connect(self.finish_tab_reveal);self.titlebar_hover_timer=QTimer(self);self.titlebar_hover_timer.setInterval(60);self.titlebar_hover_timer.timeout.connect(self.check_titlebar_hover);self.tree_hide_timer=QTimer(self);self.tree_hide_timer.setSingleShot(True);self.tree_hide_timer.timeout.connect(self.hide_tree_overlay);self.tab_context_menu_open=False;self.tab_context_menu_timer=QTimer(self);self.tab_context_menu_timer.setInterval(50);self.tab_context_menu_timer.timeout.connect(self.close_tab_context_menu_if_cursor_left)
+        self.root_widget=root;root.setMouseTracking(True);QApplication.instance().installEventFilter(self);self.main_hide_timer=QTimer(self);self.main_hide_timer.setSingleShot(True);self.main_hide_timer.timeout.connect(self.hide_main_panel);self.ctrl_organization_timer=QTimer(self);self.ctrl_organization_timer.setSingleShot(True);self.ctrl_organization_timer.setInterval(50);self.ctrl_organization_timer.timeout.connect(self.enable_ctrl_organization_mode);self.ctrl_organization_held=False;self.ctrl_key_down=False;self.tab_reveal_timer=QTimer(self);self.tab_reveal_timer.setSingleShot(True);self.tab_reveal_timer.setInterval(2000);self.tab_reveal_timer.timeout.connect(self.finish_tab_reveal);self.titlebar_hover_timer=QTimer(self);self.titlebar_hover_timer.setInterval(60);self.titlebar_hover_timer.timeout.connect(self.check_titlebar_hover);self.tree_hide_timer=QTimer(self);self.tree_hide_timer.setSingleShot(True);self.tree_hide_timer.timeout.connect(self.hide_tree_overlay);self.tab_context_menu_open=False;self.tab_context_menu_timer=QTimer(self);self.tab_context_menu_timer.setInterval(50);self.tab_context_menu_timer.timeout.connect(self.close_tab_context_menu_if_cursor_left)
         self.favorite_overlay_timer=QTimer(self);self.favorite_overlay_timer.setSingleShot(True);self.favorite_overlay_timer.setInterval(500);self.favorite_overlay_timer.timeout.connect(self.hide_favorite_controls)
         self.favorite_picker_close_timer=QTimer(self);self.favorite_picker_close_timer.setInterval(20);self.favorite_picker_close_timer.timeout.connect(self.check_favorite_picker_dismiss);self.favorite_picker_leave_since=None
         self.favorite_group_overlay=QToolButton(root);self.favorite_group_overlay.setText('＋');self.favorite_group_overlay.setToolTip('Create a favorites group');self.favorite_group_overlay.setFixedSize(58,36);self.favorite_group_overlay.clicked.connect(self.create_favorite_group);self.favorite_group_overlay.hide()
-        self.favorite_organize_overlay=QToolButton(root);self.favorite_organize_overlay.setText('↔');self.favorite_organize_overlay.setToolTip('Enable favorites organization mode');self.favorite_organize_overlay.setCheckable(True);self.favorite_organize_overlay.setFixedSize(58,36);self.favorite_organize_overlay.toggled.connect(self.set_favorite_organization_mode);self.favorite_organize_overlay.hide()
+        self.favorite_organize_overlay=QToolButton(root);self.favorite_organize_overlay.setText('↔');self.favorite_organize_overlay.setToolTip('Organization mode (Ctrl)');self.favorite_organize_overlay.setCheckable(True);self.favorite_organize_overlay.setFixedSize(58,36);self.favorite_organize_overlay.toggled.connect(self.set_favorite_organization_mode);self.favorite_organize_overlay.hide()
         self.selection_clear_overlay=QToolButton(root);self.selection_clear_overlay.setText('×');self.selection_clear_overlay.setToolTip('Clear selection');self.selection_clear_overlay.setFixedSize(58,36);self.selection_clear_overlay.clicked.connect(lambda:self.grid.clear_selection());self.selection_clear_overlay.hide()
-        self.selection_all_overlay=QToolButton(root);self.selection_all_overlay.setText('☑');self.selection_all_overlay.setToolTip('Select all items on this page');self.selection_all_overlay.setFixedSize(58,36);self.selection_all_overlay.clicked.connect(self.grid.select_all_current);self.selection_all_overlay.hide()
+        self.selection_all_overlay=QToolButton(root);self.selection_all_overlay.setText('☑');self.selection_all_overlay.setToolTip('Select all items on this page (Ctrl+A)');self.selection_all_overlay.setFixedSize(58,36);self.selection_all_overlay.clicked.connect(self.grid.select_all_current);self.selection_all_overlay.hide()
         self.selection_undo_overlay=QToolButton(root);self.selection_undo_overlay.setText('↶');self.selection_undo_overlay.setToolTip('Undo last deselection (Ctrl+Z)');self.selection_undo_overlay.setFixedSize(58,36);self.selection_undo_overlay.clicked.connect(self.grid.undo_deselection);self.selection_undo_overlay.hide()
         self.set_button_asset(self.favorite_group_overlay,'createfavoritegroup.png');self.set_button_asset(self.favorite_organize_overlay,'organizationmode.png');self.set_button_asset(self.selection_clear_overlay,'clearselect.png');self.set_button_asset(self.selection_undo_overlay,'undo.png')
         self.grid.verticalScrollBar().rangeChanged.connect(lambda *_:self.position_right_controls())
+        self.activity_overlay=ActivityOverlay(root);self.activity_overlay.raise_()
+        self.operation_show_timer=QTimer(self);self.operation_show_timer.setSingleShot(True);self.operation_show_timer.setInterval(220);self.operation_show_timer.timeout.connect(self.show_pending_operation)
+        self._pending_operation_text=''
         self.update_selection_button()
     def toggle_selection(self):
         self.grid.clear_selection()
@@ -2178,6 +2506,50 @@ class Explorer(QMainWindow):
         count=len(getattr(self.grid,'selected_paths',())) if hasattr(self,'grid') else 0
         self.selection_clear_overlay.setToolTip(f'Clear selection ({count} selected)' if count else 'Clear selection')
         if hasattr(self,'farviewbtn'):self.farviewbtn.setToolTip('Create a Farview tab from the selected files and folders' if count else f'Create a Farview tab from {self.current} and its image subfolders')
+        if hasattr(self,'activity_overlay'):
+            files=folders=total=unknown=0
+            for key in self.grid.selected_paths:
+                if str(key).startswith('favgroup://'):continue
+                item=next(iter(self.grid.items_by_path.get(str(key),())),None)
+                if item is not None:
+                    self.grid.selected_metadata[str(key)]={'is_dir':bool(item.get('is_dir')),'size':item.get('size')}
+                metadata=self.grid.selected_metadata.get(str(key),{})
+                if (item is not None and item.get('is_dir')) or (item is None and metadata.get('is_dir')):
+                    folders+=1;size=self.grid.folder_size_cache.get(str(key),(item.get('size') if item is not None else metadata.get('size')))
+                    if size is None:
+                        unknown+=1
+                        if item is not None:self.grid.request_folder_size(item)
+                    else:total+=max(0,int(size))
+                else:
+                    files+=1
+                    size=item.get('size') if item is not None else metadata.get('size')
+                    if size is None:unknown+=1
+                    else:total+=max(0,int(size))
+            self.grid.selected_metadata={key:value for key,value in self.grid.selected_metadata.items() if key in self.grid.selected_paths}
+            label=f'{files} file(s) · {folders} folder(s) · {self.format_bytes(total)}'
+            if unknown:label+=f' · {unknown} size(s) calculating'
+            self.activity_overlay.set_selection(label if files+folders else '')
+            self.position_activity_overlay()
+    @staticmethod
+    def format_bytes(value):
+        size=max(0,float(value));units=('B','KiB','MiB','GiB','TiB')
+        for unit in units:
+            if size<1024 or unit==units[-1]:return f'{size:.0f} {unit}' if unit=='B' else f'{size:.1f} {unit}'
+            size/=1024
+    def position_activity_overlay(self):
+        if not hasattr(self,'activity_overlay') or not hasattr(self,'root_widget'):return
+        overlay=self.activity_overlay;overlay.adjustSize();margin=14
+        overlay.move(max(margin,self.root_widget.width()-overlay.width()-margin),max(margin,self.root_widget.height()-overlay.height()-margin));overlay.raise_()
+    def begin_operation(self,message):
+        self._pending_operation_text=str(message)
+        if hasattr(self,'activity_overlay'):self.activity_overlay.set_operation('')
+        self.operation_show_timer.start()
+    def show_pending_operation(self):
+        if self._pending_operation_text and hasattr(self,'activity_overlay'):
+            self.activity_overlay.set_operation(self._pending_operation_text);self.position_activity_overlay()
+    def finish_operation(self):
+        self.operation_show_timer.stop();self._pending_operation_text=''
+        if hasattr(self,'activity_overlay'):self.activity_overlay.set_operation('');self.position_activity_overlay()
     def hide_favorite_controls(self):
         for widget in self.right_control_widgets():widget.hide()
     def right_control_widgets(self):
@@ -2189,23 +2561,25 @@ class Explorer(QMainWindow):
         if scrollbar.isVisible() and scrollbar.width()>0:
             scrollbar_left=scrollbar.mapTo(self.root_widget,QPoint(0,0)).x();x=scrollbar_left-button_width-gap
         y=self.main_bar.height()+self.nav_bar.height()+5
-        widgets=[self.favorite_group_overlay,self.favorite_organize_overlay] if self.in_favorites_view else []
+        widgets=([self.favorite_group_overlay] if self.in_favorites_view and self.active_favorite_group is None else [])+[self.favorite_organize_overlay]
         widgets += [self.selection_clear_overlay,self.selection_all_overlay,self.selection_undo_overlay]
         for row,widget in enumerate(widgets):widget.setGeometry(x,y+row*42,button_width,36)
     def show_right_controls(self):
         self.position_right_controls()
-        if self.in_favorites_view:self.favorite_group_overlay.show();self.favorite_organize_overlay.show()
-        else:self.favorite_group_overlay.hide();self.favorite_organize_overlay.hide()
+        if self.in_favorites_view and self.active_favorite_group is None:self.favorite_group_overlay.show()
+        else:self.favorite_group_overlay.hide()
+        self.favorite_organize_overlay.show()
         self.selection_clear_overlay.show();self.selection_all_overlay.show();self.selection_undo_overlay.show()
         for widget in self.right_control_widgets():widget.raise_()
     def toggle_search_navigation_focus(self):
-        if QApplication.focusWidget() is self.search and (not self.auto_hide_main or self.main_bar.isVisible()):
+        if QApplication.focusWidget() is self.search:
             self.grid.setFocus()
             if self.grid.navigation_index<0 and self.grid.items:self.grid.navigation_index=min(self.grid.visible_range()[0],len(self.grid.items)-1)
             self.grid.ensure_navigation_visible(self.grid.navigation_index)
+            if self.auto_hide_main and not self.main_hide_timer.isActive():self.main_hide_timer.start(self.main_hide_delay)
             return
         if self.auto_hide_main:
-            self.main_hide_timer.stop();self.set_main_panel_visible(True);self.main_hide_timer.start(self.main_hide_delay)
+            self.main_hide_timer.stop();self.set_main_panel_visible(True)
         else:self.set_main_panel_visible(True)
         self.search.setFocus(Qt.ShortcutFocusReason);self.search.selectAll()
     def viewer_closed(self):
@@ -2213,8 +2587,26 @@ class Explorer(QMainWindow):
         if not self.auto_hide_tree and getattr(self,'tree_was_visible_before_viewer',False) and hasattr(self,'tree_dock'):self.tree_dock.show();self.refresh_file_tree()
         self.tree_was_visible_before_viewer=False
     def set_favorite_organization_mode(self,enabled):
-        self.favorite_organize_mode=bool(enabled);self.favorite_organize_overlay.setToolTip('Disable favorites organization mode' if enabled else 'Enable favorites organization mode')
+        self.favorite_organize_mode=bool(enabled);self.favorite_organize_overlay.setToolTip('Organization mode (Ctrl)')
         if self.favorite_organize_overlay.isChecked()!=self.favorite_organize_mode:self.favorite_organize_overlay.setChecked(self.favorite_organize_mode)
+        if enabled and self.sort!='manual':self.set_sort('manual')
+        self.grid.viewport().update()
+
+    def enable_ctrl_organization_mode(self):
+        active=QApplication.activeWindow()
+        if self.ctrl_key_down and not isinstance(active,MediaViewer):
+            self.ctrl_organization_held=True;self.set_favorite_organization_mode(True)
+
+    def configure_thumbnail_cache_location(self):
+        selected=QFileDialog.getExistingDirectory(self,'Choose thumbnail cache folder',str(self.persistent_thumb_dir))
+        if not selected:return
+        target=Path(selected).expanduser().resolve()
+        try:target.mkdir(parents=True,exist_ok=True)
+        except OSError as exc:QMessageBox.warning(self,'Thumbnail cache location',f'Could not use this folder:\n{exc}');return
+        if not target.is_dir():QMessageBox.warning(self,'Thumbnail cache location','The selected location is not a folder.');return
+        self.persistent_thumb_dir=target;self.thumbnail_cache_dir=str(target)
+        self.grid.persistent_folder_cache_dir=target;self.grid._thumb_cache_roots_cache=None;self.grid._thumb_cache_roots_generation=None
+        self.save_settings();self.status.setText(f'Thumbnail cache: {target}')
     def configure_thumbnail_cache_limit(self):
         dlg=QDialog(self);dlg.setWindowTitle('Thumbnail memory cache');layout=QVBoxLayout(dlg)
         row=QHBoxLayout();row.addWidget(QLabel('Maximum thumbnail memory'));limit=QSpinBox();limit.setRange(16,8192);limit.setSingleStep(256);limit.setSuffix(' MiB');limit.setValue(self.thumbnail_cache_limit_mib);row.addWidget(limit);layout.addLayout(row)
@@ -2243,7 +2635,9 @@ class Explorer(QMainWindow):
                     entries=[];total=0
                     with os.scandir(cache_dir) as items:
                         for entry in items:
-                            if not entry.name.lower().endswith('.jpg'):continue
+                            # Only remove files created by _persistent_folder_thumb_path.
+                            # Cache location is user-selectable and may contain personal photos.
+                            if not re.fullmatch(r'[0-9a-f]{40}\.jpg',entry.name,re.IGNORECASE):continue
                             try:
                                 if not entry.is_file(follow_symlinks=False):continue
                                 stat=entry.stat(follow_symlinks=False);size=max(0,stat.st_size);total+=size;entries.append((stat.st_mtime_ns,size,Path(entry.path)))
@@ -2265,51 +2659,131 @@ class Explorer(QMainWindow):
     def set_thumbnail_cache_enabled(self,enabled):
         self.thumbnail_cache_enabled=bool(enabled)
         if hasattr(self,'grid'):
-            self.grid.cache.clear();self.grid.cache_bytes=0;self.grid.viewport().update()
+            self.grid.cache.clear();self.grid.cache_bytes=0;self.grid.clear_card_cache();self.grid.viewport().update()
         self.save_settings()
     def toggle_file_tree(self):
         active=QApplication.activeWindow()
         if active is not None and active is not self:return
-        if not hasattr(self,'tree_dock'):
+        created=not hasattr(self,'tree_dock')
+        if created:
             self.build_file_tree()
-        if self.tree_dock.isVisible():
-            self.tree_hide_timer.stop();self.tree_dock.hide()
+        if created:
+            if self.auto_hide_tree:self.show_tree_overlay()
+            else:self.tree_dock.show()
+        elif self.tree_dock.isVisible():
+            self.tree_hide_timer.stop();self.save_tree_navigation_state();self.tree_dock.hide()
         elif self.auto_hide_tree:self.show_tree_overlay()
         else:self.tree_dock.show()
-        if self.tree_dock.isVisible():self.refresh_file_tree()
+        if created and self.tree_dock.isVisible() and not getattr(self,'_tree_initialized',False):self.refresh_file_tree()
 
     def show_tree_overlay(self):
         if not hasattr(self,'tree_dock'):return
         origin=self.root_widget.mapToGlobal(QPoint(0,0))
         self.tree_dock.setGeometry(origin.x(),origin.y(),300,self.root_widget.height())
         self.tree_dock.show();self.tree_dock.raise_();self.tree_hide_timer.stop()
+        if not getattr(self,'_tree_initialized',False):self.refresh_file_tree()
+
+    def tree_panel_contains_global(self,position):
+        if not hasattr(self,'tree_dock') or not self.tree_dock.isVisible():return False
+        origin=self.tree_dock.mapToGlobal(QPoint(0,0))
+        if QRect(origin,self.tree_dock.size()).adjusted(-4,-4,4,4).contains(position):return True
+        if hasattr(self,'file_tree'):
+            bar=self.file_tree.verticalScrollBar();bar_origin=bar.mapToGlobal(QPoint(0,0))
+            if QRect(bar_origin,bar.size()).adjusted(-5,-3,5,3).contains(position):return True
+        return False
+
+    def begin_tree_scrollbar_interaction(self):
+        self.tree_scrollbar_interacting=True
+        self.tree_hide_timer.stop()
+
+    def finish_tree_scrollbar_interaction(self):
+        self.tree_scrollbar_interacting=False
+        if self.auto_hide_tree and hasattr(self,'tree_dock') and self.tree_dock.isVisible():
+            if self.tree_panel_contains_global(QCursor.pos()):self.tree_hide_timer.stop()
+            else:self.tree_hide_timer.start(self.tree_hide_delay)
 
     def build_file_tree(self):
+        self.tree_scroll_save_timer=QTimer(self);self.tree_scroll_save_timer.setSingleShot(True);self.tree_scroll_save_timer.timeout.connect(self.persist_tree_scroll_position)
+        self._tree_rebuilding=False;self._tree_restoring_scroll=False;self._tree_initialized=False;self.tree_scrollbar_interacting=False
         self.tree_dock=QDockWidget('File Tree',self)
         self.tree_dock.setObjectName('fileTreeDock')
         self.tree_dock.setAllowedAreas(Qt.LeftDockWidgetArea)
         self.tree_dock.setFeatures(QDockWidget.DockWidgetClosable)
         title=QWidget(self.tree_dock);title_row=QHBoxLayout(title);title_row.setContentsMargins(8,2,4,2);title_row.setSpacing(4)
         title_label=QLabel('File Tree',title);title_label.setStyleSheet('color:#eee;font-weight:600;');title_row.addWidget(title_label);title_row.addStretch(1)
-        close_button=QToolButton(title);close_button.setObjectName('treeCloseButton');close_button.setText('×');close_button.setToolTip('Close file tree');close_button.setFixedSize(28,26);close_button.setStyleSheet('QToolButton#treeCloseButton{min-width:0;min-height:0;padding:0;}');close_button.clicked.connect(self.tree_dock.hide);title_row.addWidget(close_button);self.tree_dock.setTitleBarWidget(title)
+        close_button=QToolButton(title);close_button.setObjectName('treeCloseButton');close_button.setText('×');close_button.setToolTip('Close file tree');close_button.setFixedSize(28,26);close_button.setStyleSheet('QToolButton#treeCloseButton{min-width:0;min-height:0;padding:0;}');close_button.clicked.connect(self.close_file_tree_panel);title_row.addWidget(close_button);self.tree_dock.setTitleBarWidget(title)
         self.file_tree=QTreeWidget()
         self._tree_generation=0;self._tree_scan_active=set();self._tree_bridge=TreeScanBridge(self);self._tree_bridge.completed.connect(self.finish_tree_scan)
         self.file_tree.setHeaderHidden(True)
         self.file_tree.setIndentation(16)
         self.file_tree.setAnimated(True)
         self.file_tree.itemExpanded.connect(self.expand_tree_item)
+        self.file_tree.itemExpanded.connect(self.remember_tree_expanded)
+        self.file_tree.itemCollapsed.connect(self.remember_tree_collapsed)
+        self.file_tree.currentItemChanged.connect(self.remember_tree_selection)
+        self.file_tree.verticalScrollBar().valueChanged.connect(self.remember_tree_scroll)
+        self.file_tree.verticalScrollBar().sliderPressed.connect(self.begin_tree_scrollbar_interaction)
+        self.file_tree.verticalScrollBar().sliderReleased.connect(self.finish_tree_scrollbar_interaction)
         self.file_tree.itemClicked.connect(self.file_tree_clicked)
         self.file_tree.itemDoubleClicked.connect(self.file_tree_double_clicked)
         self.file_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.file_tree.customContextMenuRequested.connect(self.file_tree_context_menu)
         self.tree_dock.setWidget(self.file_tree)
         self.addDockWidget(Qt.LeftDockWidgetArea,self.tree_dock)
-        self.tree_dock.visibilityChanged.connect(lambda visible: self.refresh_file_tree() if visible else None)
 
     def _tree_path(self,item):
         raw=item.data(0,TREE_PATH_ROLE)
         if not raw or str(raw).startswith('__'): return None
         return Path(str(raw))
+
+    def save_tree_navigation_state(self):
+        """Capture tree expansion and selection before the panel is hidden."""
+        if not hasattr(self,'file_tree'):
+            return
+        timer=getattr(self,'tree_scroll_save_timer',None)
+        if timer is not None:timer.stop()
+        stable=not (getattr(self,'_tree_rebuilding',False) or getattr(self,'_tree_restoring_scroll',False) or getattr(self,'_tree_scroll_restore_pending',False))
+        if stable:
+            for top_index in range(self.file_tree.topLevelItemCount()):
+                stack=[self.file_tree.topLevelItem(top_index)]
+                while stack:
+                    node=stack.pop();path=self._tree_path(node)
+                    if path:
+                        key=str(path)
+                        if node.isExpanded():self.tree_expanded_paths.add(key)
+                        else:self.tree_expanded_paths.discard(key)
+                    stack.extend(node.child(i) for i in range(node.childCount()))
+            self.tree_scroll_value=self.file_tree.verticalScrollBar().value()
+            self.capture_tree_scroll_anchor()
+            current=self.file_tree.currentItem();path=self._tree_path(current) if current else None
+            if path:self.tree_selected_path=str(path)
+        self.save_settings()
+
+    def close_file_tree_panel(self):
+        self.save_tree_navigation_state()
+        if hasattr(self,'tree_dock'):self.tree_dock.hide()
+
+    def remember_tree_scroll(self,value):
+        if getattr(self,'_tree_rebuilding',False) or getattr(self,'_tree_restoring_scroll',False):return
+        self.tree_scroll_value=max(0,int(value))
+        self.capture_tree_scroll_anchor()
+        timer=getattr(self,'tree_scroll_save_timer',None)
+        if timer is not None:timer.start(350)
+
+    def capture_tree_scroll_anchor(self):
+        """Remember the first visible real folder and its viewport-relative offset."""
+        if not hasattr(self,'file_tree'):return
+        item=self.file_tree.itemAt(QPoint(8,2))
+        path=self._tree_path(item) if item is not None else None
+        if path is None:return
+        rect=self.file_tree.visualItemRect(item)
+        self.tree_scroll_anchor_path=str(path)
+        self.tree_scroll_anchor_offset=int(rect.top())
+
+    def persist_tree_scroll_position(self):
+        if self._closing:return
+        try:self.save_settings()
+        except Exception:logger.exception('Could not persist File Tree scroll position')
 
     def _add_tree_placeholder(self,item):
         child=QTreeWidgetItem([''])
@@ -2325,7 +2799,22 @@ class Explorer(QMainWindow):
 
     def refresh_file_tree(self):
         if not hasattr(self,'file_tree') or not self.tree_dock.isVisible(): return
+        if not getattr(self,'_tree_rebuilding',False) and not getattr(self,'_tree_scroll_restore_pending',False):
+            self.tree_scroll_value=self.file_tree.verticalScrollBar().value()
+            self.capture_tree_scroll_anchor()
+            for top_index in range(self.file_tree.topLevelItemCount()):
+                stack=[self.file_tree.topLevelItem(top_index)]
+                while stack:
+                    node=stack.pop();path=self._tree_path(node)
+                    if path:
+                        if node.isExpanded():self.tree_expanded_paths.add(str(path))
+                        else:self.tree_expanded_paths.discard(str(path))
+                    stack.extend(node.child(i) for i in range(node.childCount()))
+            current=self.file_tree.currentItem();current_path=self._tree_path(current) if current else None
+            if current_path:self.tree_selected_path=str(current_path)
+        self._tree_scroll_restore_pending=True
         self._tree_generation+=1
+        self._tree_rebuilding=True
         self.file_tree.clear()
         fav_root=QTreeWidgetItem(['★ Tree Favorites'])
         fav_root.setData(0,TREE_PATH_ROLE,'__favorites__')
@@ -2345,6 +2834,66 @@ class Explorer(QMainWindow):
             self._add_tree_placeholder(item)
             self.file_tree.addTopLevelItem(item)
         self.file_tree.setStyleSheet('QTreeWidget{background:#15171c;color:#ddd;border:0;padding:8px 5px;font-size:13px;} QTreeWidget::item{padding:5px 4px;} QTreeWidget::item:hover{background:#2b2d31;} QTreeWidget::item:selected{background:#51441d;color:#fff;}')
+        self._tree_initialized=True
+        generation=self._tree_generation
+        QTimer.singleShot(0,lambda token=generation:self.restore_tree_navigation(token))
+
+    def _find_tree_item(self,target):
+        if not target or not hasattr(self,'file_tree'):return None
+        target_key=self._normalized_path_key(target);stack=[self.file_tree.topLevelItem(i) for i in range(self.file_tree.topLevelItemCount())]
+        while stack:
+            item=stack.pop();path=self._tree_path(item)
+            if path and self._normalized_path_key(path)==target_key:return item
+            stack.extend(item.child(i) for i in range(item.childCount()))
+        return None
+
+    def restore_tree_navigation(self,generation=None):
+        if not hasattr(self,'file_tree'):return
+        if generation is not None and generation!=self._tree_generation:return
+        targets=sorted(self.tree_expanded_paths,key=lambda path:(str(path).count(os.sep),str(path).casefold()))
+        ordered_targets=targets+([self.tree_selected_path] if self.tree_selected_path else [])+([self.tree_scroll_anchor_path] if self.tree_scroll_anchor_path else [])
+        for path in ordered_targets:
+            item=self._find_tree_item(path)
+            if item is None:
+                parent=self._find_tree_item(str(Path(path).parent))
+                children=parent.data(0,TREE_CHILDREN_ROLE) if parent is not None else None
+                if parent is not None and isinstance(children,list):
+                    while item is None and int(parent.data(0,TREE_PAGE_ROLE) or 0)<len(children):
+                        self.append_tree_page(parent);item=self._find_tree_item(path)
+            should_expand=path in self.tree_expanded_paths or path==self.tree_selected_path
+            if item is not None and should_expand and not item.isExpanded():item.setExpanded(True)
+        selected=self._find_tree_item(self.tree_selected_path)
+        if selected is not None:self.file_tree.setCurrentItem(selected)
+        if self._tree_scroll_restore_pending:
+            if any(scan_generation==self._tree_generation for scan_generation,_ in getattr(self,'_tree_scan_active',())):
+                QTimer.singleShot(40,lambda token=self._tree_generation:self.restore_tree_navigation(token))
+            else:
+                self._tree_restoring_scroll=True
+                try:
+                    bar=self.file_tree.verticalScrollBar()
+                    anchor=self._find_tree_item(self.tree_scroll_anchor_path) if self.tree_scroll_anchor_path else None
+                    if anchor is not None:
+                        self.file_tree.scrollToItem(anchor,QAbstractItemView.PositionAtTop)
+                        bar.setValue(max(0,min(bar.value()-self.tree_scroll_anchor_offset,bar.maximum())))
+                    else:bar.setValue(min(self.tree_scroll_value,bar.maximum()))
+                    self.tree_scroll_value=bar.value();self.capture_tree_scroll_anchor();self._tree_scroll_restore_pending=False
+                finally:
+                    self._tree_restoring_scroll=False;self._tree_rebuilding=False
+
+    def remember_tree_expanded(self,item):
+        path=self._tree_path(item)
+        if path:
+            self.tree_expanded_paths.add(str(path));self.save_settings()
+
+    def remember_tree_collapsed(self,item):
+        path=self._tree_path(item)
+        if path:
+            self.tree_expanded_paths.discard(str(path));self.save_settings()
+
+    def remember_tree_selection(self,item,previous):
+        path=self._tree_path(item) if item is not None else None
+        if path:
+            self.tree_selected_path=str(path);self.save_settings()
 
     def expand_tree_item(self,item):
         role=item.data(0,TREE_PATH_ROLE)
@@ -2383,6 +2932,7 @@ class Explorer(QMainWindow):
             while item.childCount():item.takeChild(0)
             item.setData(0,TREE_POPULATING_ROLE,False);item.setData(0,TREE_POPULATED_ROLE,True);item.setData(0,TREE_CHILDREN_ROLE,dirs);item.setData(0,TREE_PAGE_ROLE,0)
             self.append_tree_page(item)
+            QTimer.singleShot(0,lambda token=generation:self.restore_tree_navigation(token))
             if error and not dirs:self.status.setText(f'Cannot read File Tree folder: {error}')
         except RuntimeError:
             return
@@ -2401,7 +2951,7 @@ class Explorer(QMainWindow):
                 parent.removeChild(item);self.append_tree_page(parent)
             return
         path=self._tree_path(item)
-        if path and path.is_dir(): self.load(path)
+        if path and path.is_dir():self.tree_selected_path=str(path);self.save_settings();self.load(path)
 
     def file_tree_double_clicked(self,item,column):
         path=self._tree_path(item)
@@ -2446,6 +2996,7 @@ class Explorer(QMainWindow):
         if not folder.is_dir(): return
         data=dict(tab or {})
         data.setdefault('kind','folder');data['path']=str(folder)
+        if data['kind']=='farview':data.setdefault('view_id',self._normalized_path_key(folder));data.setdefault('source_order',[])
         data.setdefault('scroll',self.scroll_positions.get(str(folder),0));data.setdefault('positions',{str(folder):self.scroll_positions.get(str(folder),0)})
         data.setdefault('sort',self.sort);data.setdefault('desc',self.desc)
         self.tabs.append(data)
@@ -2487,6 +3038,31 @@ class Explorer(QMainWindow):
     def switch_tab(self, idx):
         QTimer.singleShot(0,lambda i=idx:self.activate_tab(i) if i==self.tabbar.currentIndex() else None)
 
+    def begin_tab_drag(self):
+        self._tab_drag_active=True
+        if self.auto_hide_main:
+            self.main_hide_timer.stop();self.tab_reveal_timer.stop();self.set_main_panel_visible(True)
+
+    def end_tab_drag(self):
+        self._tab_drag_active=False
+        if self.auto_hide_main:
+            pos=self.root_widget.mapFromGlobal(QCursor.pos())
+            over_panel=self.main_bar.geometry().contains(pos) or (self.nav_bar.isVisible() and self.nav_bar.geometry().contains(pos))
+            if not over_panel and not getattr(self,'tab_context_menu_open',False):self.main_hide_timer.start(self.main_hide_delay)
+
+    def tab_reordered(self,source,destination):
+        if source<0 or destination<0 or source>=len(self.tabs) or destination>=len(self.tabs):return
+        tab=self.tabs.pop(source);self.tabs.insert(destination,tab)
+        def remap(index):
+            if index==source:return destination
+            if source<destination and source<index<=destination:return index-1
+            if destination<source and destination<=index<source:return index+1
+            return index
+        self.tabbar.selected_tabs={remap(index) for index in self.tabbar.selected_tabs if 0<=index<len(self.tabs)}
+        self.tabbar.selection_anchor=remap(self.tabbar.selection_anchor) if self.tabbar.selection_anchor>=0 else -1
+        for index,record in enumerate(self.tabs):self.tabbar.setTabData(index,record.get('color',''))
+        self.active_tab_index=self.tabbar.currentIndex();self.save_settings();self.tabbar.update()
+
     def close_tab(self, idx):
         if idx is None or idx<0 or idx>=len(self.tabs): return
         now=time.monotonic()
@@ -2523,12 +3099,25 @@ class Explorer(QMainWindow):
 
     def save_current_view(self):
         self.remember_scroll(self.grid.verticalScrollBar().value())
+        idx=self.current_tab_index()
+        if self.in_favorites_view or self.return_to_favorites:return
+        if 0<=idx<len(self.tabs):
+            self.tabs[idx].update({'sort':self.sort,'desc':self.desc})
+            if self.tabs[idx].get('kind')!='farview':self._remember_folder_sort(self.current)
+        elif Path(self.current).is_dir():self._remember_folder_sort(self.current)
+
+    def _remember_folder_sort(self,folder):
+        if not Path(folder).is_dir():return
+        key=self._normalized_path_key(folder)
+        self.folder_sort_settings.pop(key,None)
+        self.folder_sort_settings[key]={'sort':self.sort,'desc':bool(self.desc)}
+        while len(self.folder_sort_settings)>5000:self.folder_sort_settings.pop(next(iter(self.folder_sort_settings)))
 
     def show_tab_context_menu(self,index,global_pos):
         self.main_hide_timer.stop();self.tab_context_menu_open=True
         if self.auto_hide_main:self.set_main_panel_visible(True)
         menu=QMenu(self);menu.setMouseTracking(True);self._tab_context_menu=menu;menu.addSection('Tab outline color')
-        colors=[None,'#e74c3c','#e67e22','#f1c40f','#2ecc71','#1abc9c','#3498db','#2980b9','#9b59b6','#e84393']
+        colors=[None,'#e74c3c','#e67e22','#f1c40f','#2ecc71','#1abc9c','#3498db','#1f3a93','#9b59b6','#e84393']
         grid_widget=QWidget();grid=QGridLayout(grid_widget);grid.setContentsMargins(8,6,8,6);grid.setHorizontalSpacing(5);grid.setVerticalSpacing(5)
         action=QWidgetAction(menu);action.setDefaultWidget(grid_widget)
         for offset,color in enumerate(colors):
@@ -2583,6 +3172,10 @@ class Explorer(QMainWindow):
             self.tabbar.blockSignals(True);self.tabbar.setCurrentIndex(0);self.tabbar.blockSignals(False)
         if save_previous:self.save_current_view()
         self.current=folder
+        folder_sort=self.folder_sort_settings.get(self._normalized_path_key(folder))
+        if isinstance(folder_sort,dict):
+            self.sort=folder_sort.get('sort',self.sort);self.desc=bool(folder_sort.get('desc',False))
+        self._remember_folder_sort(folder)
         # Clear the old scrollbar immediately. This prevents a newly loaded
         # folder from inheriting the previous folder's maximum scroll value
         # while the asynchronous scan is running.
@@ -2595,6 +3188,7 @@ class Explorer(QMainWindow):
         if 0<=idx<len(self.tabs) and not self.return_to_favorites:
             self.tabs[idx]['kind']='folder'
             self.tabs[idx]['path']=str(folder)
+            self.tabs[idx].update({'sort':self.sort,'desc':self.desc})
             positions=self.tabs[idx].setdefault('positions',{})
             if restore_scroll:
                 target_scroll=positions.get(str(folder),self.scroll_positions.get(str(folder),0))
@@ -2604,6 +3198,7 @@ class Explorer(QMainWindow):
                 positions[str(folder)]=0
                 self.tabs[idx]['scroll']=0
             self.update_tab_labels()
+        self.update_sort_buttons()
         self.start_scan(folder,recursive=False)
         if self.recursive_search_enabled and self.search.text().strip():self.search_text_changed(self.search.text())
 
@@ -2616,6 +3211,7 @@ class Explorer(QMainWindow):
         finally:self._suppress_scroll_save=False
         self.crumb.setText(f'Farview · {root}');self.status.setText('Collecting images from subfolders…')
         idx=self.current_tab_index();self.farview_unsorted=bool(self.tabs[idx].get('unsorted',True)) if 0<=idx<len(self.tabs) else True
+        if 0<=idx<len(self.tabs):self.sort=self.tabs[idx].get('sort',self.sort);self.desc=bool(self.tabs[idx].get('desc',self.desc))
         self.update_favorite_button()
         if 0<=idx<len(self.tabs):
             self.tabs[idx]['kind']='farview';self.tabs[idx]['path']=str(root);self.update_tab_labels()
@@ -2625,7 +3221,8 @@ class Explorer(QMainWindow):
     def start_scan(self,folder,recursive=False,selection=None):
         if self.scan and self.scan.isRunning():self.scan.requestInterruption()
         self.scan_generation+=1;generation=self.scan_generation
-        self.scan=ScanTask(folder,recursive=recursive,generation=generation,selection=selection)
+        self.begin_operation('Collecting Farview items…' if recursive else 'Scanning folder…')
+        self.scan=ScanTask(folder,recursive=recursive,generation=generation,selection=selection,manual_orders=self.folder_manual_orders,manual_sort_settings=self.folder_sort_settings)
         self.scan_jobs.append(self.scan)
         self.scan.finished.connect(lambda job=self.scan:self.release_scan_job(job))
         self.scan.signals.done.connect(self.scanned)
@@ -2637,9 +3234,13 @@ class Explorer(QMainWindow):
 
     def scanned(self,items,error,generation=None):
         if generation is not None and generation!=self.scan_generation:return
+        self.finish_operation()
         if error:self.status.setText('Unable to read folder');QMessageBox.warning(self,'Magellan',error);return
-        self.items=items;self.refresh();self.save_settings()
         idx=self.current_tab_index()
+        if 0<=idx<len(self.tabs) and self.tabs[idx].get('kind')=='farview':
+            tab=self.tabs[idx];source_order=[self._manual_item_key(item) for item in items if self._manual_item_key(item)][:100000]
+            tab['source_order']=source_order
+        self.items=items;self.refresh();self.save_settings()
         if 0<=idx<len(self.tabs):
             target=int(self.tabs[idx].setdefault('positions',{}).get(str(self.current),self.tabs[idx].get('scroll',0)))
         else:
@@ -2661,17 +3262,21 @@ class Explorer(QMainWindow):
         idx=self.current_tab_index();farview=0<=idx<len(self.tabs) and self.tabs[idx].get('kind')=='farview'
         if k!='size':self.grid.clear_folder_size_queue()
         preserve_folder_order=farview and self.tabs[idx].get('unsorted',True)
-        if k=='random':
+        if k=='manual':
+            if self.sort!='manual':self._seed_manual_order()
+            self.sort='manual';self.desc=False
+        elif k=='random':
             self.sort='random';self.desc=False
         elif self.sort==k and not preserve_folder_order:self.desc=not self.desc
         else:self.sort=k;self.desc=False
         if 0<=idx<len(self.tabs):self.tabs[idx].update({'sort':self.sort,'desc':self.desc})
         if farview:self.tabs[idx]['unsorted']=False
+        elif not self.in_favorites_view and not self.return_to_favorites:self._remember_folder_sort(self.current)
         self.update_sort_buttons();self.refresh()
         self.save_settings()
 
     def update_sort_buttons(self):
-        labels={'name':('↥','Name'),'mtime':('↧','Last modified'),'ctime':('◷','Last created'),'type':('◇','Type'),'size':('⇵','Size'),'random':('⤨','Random folders')}
+        labels={'name':('↥','Name'),'mtime':('↧','Last modified'),'ctime':('◷','Last created'),'type':('◇','Type'),'size':('⇵','Size'),'random':('⤨','Random folders'),'manual':('↕','Personal order')}
         idx=self.current_tab_index();folder_order=0<=idx<len(self.tabs) and self.tabs[idx].get('kind')=='farview' and self.tabs[idx].get('unsorted',True)
         for key,b in self.sortBtns.items():
             icon,title=labels[key]
@@ -2685,9 +3290,64 @@ class Explorer(QMainWindow):
             else:
                 scaled=source.scaled(22,22,Qt.KeepAspectRatio,Qt.SmoothTransformation)
                 painter.drawPixmap((23-scaled.width())//2,1+(22-scaled.height())//2,scaled)
-            if active:
+            if active and key!='manual':
                 painter.setPen(QColor('#f5f5f5'));painter.setFont(QFont('Segoe UI Symbol',12,QFont.Bold));painter.drawText(QRect(23,0,22,24),Qt.AlignCenter,'▼' if self.desc else '▲')
-            painter.end();b.setIcon(QIcon(composed));b.setText('');b.setIconSize(QSize(46,24));b.setToolTip(f'{title} — {"Descending" if self.desc else "Ascending"}' if active else title);b.setChecked(active)
+            painter.end();b.setIcon(QIcon(composed));b.setText('');b.setIconSize(QSize(46,24));b.setToolTip(title if key=='manual' else (f'{title} — {"Descending" if self.desc else "Ascending"}' if active else title));b.setChecked(active)
+
+    def _manual_view_key(self):
+        if self.in_favorites_view:return 'favorites:root' if self.active_favorite_group is None else f'favorites:group:{self.active_favorite_group}'
+        idx=self.current_tab_index()
+        if 0<=idx<len(self.tabs) and self.tabs[idx].get('kind')=='farview':return 'farview:'+str(self.tabs[idx].get('view_id') or self._normalized_path_key(self.tabs[idx].get('path','')))
+        return 'folder:'+self._normalized_path_key(self.current)
+
+    def _record_manual_order_created(self,key):
+        if key and key in self.folder_manual_orders and key not in self.manual_order_created:self.manual_order_created[key]=time.time()
+
+    @staticmethod
+    def _manual_item_key(item):
+        path=str(item.get('path',''))
+        if path.startswith('favgroup://'):return path
+        return os.path.normcase(os.path.normpath(os.path.abspath(path))) if path else ''
+
+    def _seed_manual_order(self):
+        key=self._manual_view_key()
+        if not self.folder_manual_orders.get(key):
+            idx=self.current_tab_index();tab=self.tabs[idx] if 0<=idx<len(self.tabs) else {}
+            source=tab.get('source_order',[]) if tab.get('kind')=='farview' else []
+            self.folder_manual_orders[key]=list(source) if source else [self._manual_item_key(item) for item in self.grid.items if self._manual_item_key(item)]
+            self._record_manual_order_created(key)
+
+    def _apply_manual_order(self,items):
+        key=self._manual_view_key();order=self.folder_manual_orders.get(key)
+        if not order:
+            idx=self.current_tab_index();tab=self.tabs[idx] if 0<=idx<len(self.tabs) else {}
+            source=tab.get('source_order',[]) if tab.get('kind')=='farview' else []
+            order=list(source) if source else [self._manual_item_key(item) for item in items if self._manual_item_key(item)]
+            self.folder_manual_orders[key]=order;self._record_manual_order_created(key)
+        ranks={value:index for index,value in enumerate(order)}
+        # Stable fallback keeps newly discovered/unrecorded entries visible after existing entries.
+        if self.in_favorites_view and self.active_favorite_group is None:
+            items.sort(key=lambda item:(0 if item.get('kind')=='favorite_group' else 1,ranks.get(self._manual_item_key(item),len(ranks))))
+        else:items.sort(key=lambda item:ranks.get(self._manual_item_key(item),len(ranks)))
+
+    def _reorder_manual_items(self,paths,target_index,before):
+        if not (0<=target_index<len(self.grid.items)):return False
+        visible_keys={self._manual_item_key(item) for item in self.grid.items}
+        moved={os.path.normcase(os.path.normpath(os.path.abspath(path))) for path in paths}&visible_keys
+        if not moved:return False
+        target=self._manual_item_key(self.grid.items[target_index])
+        if target in moved:return False
+        order=self.folder_manual_orders.get(self._manual_view_key()) or [self._manual_item_key(item) for item in self.items]
+        order=[value for value in order if value]
+        moving=[value for value in order if value in moved]
+        if not moving:return False
+        order=[value for value in order if value not in moved]
+        try:insert_at=order.index(target)+(0 if before else 1)
+        except ValueError:return False
+        order[insert_at:insert_at]=moving
+        self.folder_manual_orders[self._manual_view_key()]=order
+        self._record_manual_order_created(self._manual_view_key())
+        self.refresh();self.save_settings();return True
 
     def set_mode(self,m):self.mode=m;self.vbtn.setChecked(m=='vertical');self.hbtn.setChecked(m=='horizontal');self.grid.setMode(m);self.refresh()
     def set_thumb(self,n):self.thumb=int(n);self.grid.setThumbSize(n);self.refresh()
@@ -2700,12 +3360,14 @@ class Explorer(QMainWindow):
         for job in list(getattr(self,'recursive_search_jobs',[])):
             if job.isRunning():job.requestInterruption()
         self.recursive_search_results=None;self.recursive_search_result_query=''
+        if getattr(self,'_pending_operation_text','').startswith('Searching'):self.finish_operation()
         self.refresh()
         if self.recursive_search_enabled and text.strip() and not self.in_favorites_view:
-            self.status.setText('Searching subfolders…');self.recursive_search_timer.start()
+            self.status.setText('Searching subfolders…');self.begin_operation('Searching subfolders…');self.recursive_search_timer.start()
     def start_recursive_search(self):
         query=self.search.text().casefold().strip()
         if not self.recursive_search_enabled or not query or self.in_favorites_view:return
+        self.begin_operation('Searching subfolders…')
         generation=self.recursive_search_generation
         task=RecursiveSearchTask(self.current,query,generation);self.recursive_search_jobs.append(task)
         task.signals.done.connect(self.recursive_search_finished)
@@ -2717,10 +3379,11 @@ class Explorer(QMainWindow):
     def recursive_search_finished(self,items,error,generation,limited,folder):
         if generation!=self.recursive_search_generation or folder!=str(self.current) or not self.recursive_search_enabled or self.in_favorites_view:return
         if error:
-            self.status.setText('Recursive search failed');QMessageBox.warning(self,'Search failed',error);return
+            self.finish_operation();self.status.setText('Recursive search failed');QMessageBox.warning(self,'Search failed',error);return
         self.recursive_search_results=items;self.recursive_search_result_query=self.search.text().casefold().strip();self.refresh()
         if limited:self.status.setText(f'{len(items)} results — refine search (10,000 result limit)')
         else:self.status.setText(f'{len(items)} recursive search results')
+        self.finish_operation()
     def refresh(self):
         q=self.search.text().casefold().strip()
         source=self.recursive_search_results if self.recursive_search_enabled and q and self.recursive_search_result_query==q and self.recursive_search_results is not None else self.items
@@ -2734,6 +3397,8 @@ class Explorer(QMainWindow):
         active_idx=self.current_tab_index();is_farview=active_idx>=0 and self.tabs[active_idx].get('kind')=='farview'
         if is_farview and self.tabs[active_idx].get('unsorted',True):
             pass
+        elif self.sort=='manual':
+            self._apply_manual_order(items)
         elif self.sort=='random':
             if is_farview:
                 random.shuffle(items)
@@ -2741,7 +3406,7 @@ class Explorer(QMainWindow):
                 favorite_groups=[x for x in items if x.get('kind')=='favorite_group']
                 folders=[x for x in items if x['is_dir']]
                 files=[x for x in items if not x['is_dir'] and x.get('kind')!='favorite_group']
-                random.shuffle(folders)
+                random.shuffle(favorite_groups);random.shuffle(folders)
                 files.sort(key=name_key)
                 items=favorite_groups+folders+files
         else:
@@ -2750,20 +3415,36 @@ class Explorer(QMainWindow):
             elif self.sort in ('mtime','ctime'):key=lambda x:x[self.sort]
             elif self.sort=='size':key=lambda x:-1 if x.get('size') is None else int(x['size'])
             else:key=name_key
-            items.sort(key=lambda x:0 if x['is_dir'] else 1);items.sort(key=key,reverse=self.desc)
-            group_order={str(item['path']):rank for rank,item in enumerate(x for x in self.items if x.get('kind')=='favorite_group')}
-            items.sort(key=lambda x:(0,group_order.get(str(x['path']),0)) if x.get('kind')=='favorite_group' else (1,0 if x['is_dir'] else 1))
+            favorite_groups=[item for item in items if item.get('kind')=='favorite_group'] if self.in_favorites_view and self.active_favorite_group is None else []
+            folders=[item for item in items if item.get('is_dir')]
+            files=[item for item in items if not item.get('is_dir') and item.get('kind')!='favorite_group']
+            for bucket in (favorite_groups,folders,files):bucket.sort(key=key,reverse=self.desc)
+            items=favorite_groups+folders+files
         self.grid.setFolderThumbs(self.custom);self.grid.setItems(items,reset_scroll=False)
         if self.sort=='size' and not recursive_results:
             first,last=self.grid.visible_range()
             visible_indices=range(first,min(last,first+32))
             visible_paths={str(items[index]['path']) for index in visible_indices if items[index].get('is_dir')}
             self.grid.schedule_folder_sizes(items,visible_paths)
-        suffix='' if self.sort=='random' else (' • '+('Descending' if self.desc else 'Ascending'))
+        suffix='' if self.sort in ('random','manual') else (' • '+('Descending' if self.desc else 'Ascending'))
         if is_farview and self.tabs[active_idx].get('unsorted',True):
             self.status.setText(f'{len(items)} images • Farview • folder order')
         else:
             self.status.setText(f'{len(items)} items • {self.sort}'+suffix)
+
+    def refresh_current_view(self):
+        """Reload the active view without navigating away from it."""
+        if self.in_favorites_view:
+            scroll=self.grid.verticalScrollBar().value();group_id=self.active_favorite_group
+            self.show_favorites(group_id)
+            QTimer.singleShot(0,lambda value=scroll:self.grid.verticalScrollBar().setValue(min(value,self.grid.verticalScrollBar().maximum())))
+            return
+        idx=self.current_tab_index()
+        if 0<=idx<len(self.tabs) and self.tabs[idx].get('kind')=='farview':
+            tab=self.tabs[idx]
+            self.load_farview(Path(tab['path']),save_previous=False,selection=tab.get('selection'))
+            return
+        self.load(self.current,restore_scroll=True,save_previous=False)
 
     def open_new_tab(self,path):
         p=Path(path)
@@ -2784,19 +3465,34 @@ class Explorer(QMainWindow):
 
     def create_farview(self):
         root=Path(self.current)
-        if not root.is_dir():return
-        selected=[path for path in self.grid.selected_paths if Path(path).is_dir() or (Path(path).is_file() and Path(path).suffix.casefold() in PREVIEW_EXTS)]
+        selected_keys={self._normalized_path_key(path) for path in self.grid.selected_paths if not str(path).startswith('favgroup://')}
+        selected=[str(item.get('path')) for item in self.grid.items if self._normalized_path_key(item.get('path','')) in selected_keys and (Path(item['path']).is_dir() or (Path(item['path']).is_file() and Path(item['path']).suffix.casefold() in PREVIEW_EXTS))]
+        selected_group_ids={str(path).split('://',1)[1] for path in self.grid.selected_paths if str(path).startswith('favgroup://')}
+        if self.in_favorites_view and self.active_favorite_group is None and selected_group_ids:
+            for group in self.favorite_groups:
+                if group.get('id') not in selected_group_ids:continue
+                for path in group.get('folders',[]):
+                    candidate=Path(path)
+                    if candidate.is_dir() or (candidate.is_file() and candidate.suffix.casefold() in PREVIEW_EXTS):selected.append(str(candidate))
+            selected=list(dict.fromkeys(selected))
+            if selected:
+                first=Path(selected[0]);root=first if first.is_dir() else first.parent
+        if self.in_favorites_view and self.active_favorite_group is not None and not selected:
+            group=next((g for g in self.favorite_groups if g.get('id')==self.active_favorite_group),None)
+            selected=[str(path) for path in (group or {}).get('folders',[]) if Path(path).is_dir() or (Path(path).is_file() and Path(path).suffix.casefold() in PREVIEW_EXTS)]
+            if selected:
+                first=Path(selected[0]);root=first if first.is_dir() else first.parent
+            else:self.status.setText('This Favorites group has no available folders or previewable files');return
+        if not root.is_dir():
+            root=next((Path(path) if Path(path).is_dir() else Path(path).parent for path in selected if Path(path).exists()),None)
+        if root is None or not root.is_dir():return
+        # Keep selection order stable: Favorites groups already have a deliberate
+        # order, while ordinary selection uses the visible natural order.
         if selected:
-            selected.sort(key=natural_key);selection_key=tuple(self._normalized_path_key(p) for p in selected)
-            for idx,tab in enumerate(self.tabs):
-                if tab.get('kind')=='farview' and tuple(self._normalized_path_key(p) for p in tab.get('selection',[]))==selection_key:
-                    self.tabbar.setCurrentIndex(idx);return
-            self.save_current_view();self.add_tab(root,select=True,tab={'kind':'farview','selection':selected,'sort':self.sort,'desc':self.desc,'unsorted':True,'scroll':0,'positions':{}});self.save_settings();self.reveal_panel_for_new_tab();return
-        for idx,tab in enumerate(self.tabs):
-            if tab.get('kind')=='farview' and Path(tab['path'])==root and not tab.get('selection'):
-                self.tabbar.setCurrentIndex(idx);return
+            # Farviews with identical selections are independent tabs so each can keep its own sort.
+            self.save_current_view();self.add_tab(root,select=True,tab={'kind':'farview','view_id':hashlib.sha1(os.urandom(16)).hexdigest()[:16],'selection':selected,'sort':self.sort,'desc':self.desc,'unsorted':True,'source_order':[],'scroll':0,'positions':{}});self.save_settings();self.reveal_panel_for_new_tab();return
         self.save_current_view()
-        self.add_tab(root,select=True,tab={'kind':'farview','sort':self.sort,'desc':self.desc,'unsorted':True,'scroll':0,'positions':{}})
+        self.add_tab(root,select=True,tab={'kind':'farview','view_id':hashlib.sha1(os.urandom(16)).hexdigest()[:16],'sort':self.sort,'desc':self.desc,'unsorted':True,'source_order':[],'scroll':0,'positions':{}})
         self.save_settings()
         self.reveal_panel_for_new_tab()
 
@@ -2915,23 +3611,31 @@ class Explorer(QMainWindow):
         if not group:return
         name,ok=QInputDialog.getText(self,'Rename favorites group','Group name:',text=group.get('name',''))
         if ok and name.strip():group['name']=name.strip();self.save_settings();self.show_favorites(self.active_favorite_group)
-    def handle_favorite_drop(self,payload,target_index):
-        if not self.in_favorites_view or not (0<=target_index<len(self.grid.items)):return
+    def handle_favorite_drop(self,payload,target_index,before=True):
+        if not (0<=target_index<len(self.grid.items)):return
         target=self.grid.items[target_index]
-        if target.get('kind')!='favorite_group':return
-        target_id=str(target['path']).split('://',1)[1]
-        if payload.startswith('folder-list://'):
+        if target.get('kind')=='favorite_group' and self.in_favorites_view:
+            target_id=str(target['path']).split('://',1)[1]
+            if payload.startswith('folder-list://'):
+                try:paths=[str(Path(path)) for path in json.loads(payload[len('folder-list://'):]) if Path(path).exists()]
+                except (TypeError,ValueError):return
+                if paths:self.set_favorite_group_membership(paths,target_id,True)
+            elif payload.startswith('folder://'):
+                self.add_folder_to_favorite_group(payload[len('folder://'):],target_id)
+            elif payload.startswith('favgroup://'):
+                source_id=payload.split('://',1)[1]
+                if source_id==target_id:return
+                source=next((g for g in self.favorite_groups if g.get('id')==source_id),None);dest_i=next((i for i,g in enumerate(self.favorite_groups) if g.get('id')==target_id),-1)
+                if source and dest_i>=0:
+                    self.favorite_groups.remove(source);self.favorite_groups.insert(dest_i,source)
+                    root_order=self.folder_manual_orders.get('favorites:root',[]);group_keys=[f"favgroup://{group.get('id')}" for group in self.favorite_groups];others=[value for value in root_order if value not in group_keys]
+                    self.folder_manual_orders['favorites:root']=group_keys+others
+                    self.save_settings();self.show_favorites()
+            return
+        if payload.startswith('folder-list://') and self.sort=='manual':
             try:paths=[str(Path(path)) for path in json.loads(payload[len('folder-list://'):]) if Path(path).exists()]
             except (TypeError,ValueError):return
-            if paths:self.set_favorite_group_membership(paths,target_id,True)
-        elif payload.startswith('folder://'):
-            self.add_folder_to_favorite_group(payload[len('folder://'):],target_id)
-        elif payload.startswith('favgroup://'):
-            source_id=payload.split('://',1)[1]
-            if source_id==target_id:return
-            source=next((g for g in self.favorite_groups if g.get('id')==source_id),None);dest_i=next((i for i,g in enumerate(self.favorite_groups) if g.get('id')==target_id),-1)
-            if source and dest_i>=0:
-                self.favorite_groups.remove(source);self.favorite_groups.insert(dest_i,source);self.save_settings();self.show_favorites()
+            self._reorder_manual_items(paths,target_index,before)
     def create_favorite_group(self):
         name,ok=QInputDialog.getText(self,'New favorite group','Group name:')
         name=name.strip()
@@ -2950,7 +3654,7 @@ class Explorer(QMainWindow):
             self.load(p)
         elif p.suffix.casefold() in (IMAGE_EXTS|PDF_EXTS):
             self.tree_was_visible_before_viewer=hasattr(self,'tree_dock') and self.tree_dock.isVisible()
-            if self.tree_was_visible_before_viewer:self.tree_dock.hide()
+            if self.tree_was_visible_before_viewer:self.save_tree_navigation_state();self.tree_dock.hide()
             paths=[str(item['path']) for item in self.grid.items if item.get('kind') in ('image','document') and Path(item['path']).suffix.casefold() in (IMAGE_EXTS|PDF_EXTS)]
             if str(p) not in paths:paths.append(str(p))
             self.viewer=MediaViewer(paths,paths.index(str(p)),self,self.slideshow_interval_ms);self.viewer.setAttribute(Qt.WA_DeleteOnClose);self.viewer.showFullScreen();self.viewer.activateWindow()
@@ -2973,12 +3677,14 @@ class Explorer(QMainWindow):
                     "[Console]::Write($x.TargetPath)")
                 out=subprocess.check_output(['powershell','-NoProfile','-NonInteractive','-Command',ps],creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),text=True,timeout=3)
                 return out.strip() or None
-        except Exception: pass
+        except Exception:
+            logger.debug('Could not resolve shortcut %s',p,exc_info=True)
         return None
 
     def reveal(self,p):
         try:
-            if sys.platform.startswith('win'):os.startfile(str(p))
+            if sys.platform.startswith('win'):
+                explorer=os.path.join(os.environ.get('WINDIR',r'C:\Windows'),'explorer.exe');subprocess.Popen([explorer,str(Path(p).resolve())])
             elif sys.platform=='darwin':subprocess.Popen(['open',str(p)])
             else:subprocess.Popen(['xdg-open',str(p)])
         except Exception as e:
@@ -2987,13 +3693,42 @@ class Explorer(QMainWindow):
 
     def reveal_in_folder(self,path):
         try:
-            target=str(Path(path).resolve())
+            target=str(Path(path).expanduser().resolve(strict=False))
             if sys.platform.startswith('win'):
-                explorer=os.path.join(os.environ.get('WINDIR',r'C:\Windows'),'explorer.exe')
-                subprocess.Popen(f'explorer.exe /select,"{target}"',executable=explorer,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+                if os.path.normcase(os.path.dirname(target))==os.path.normcase(target):
+                    self.reveal(target);return
+                shell32=ctypes.WinDLL('shell32',use_last_error=True);ole32=ctypes.WinDLL('ole32',use_last_error=True)
+                parse=shell32.SHParseDisplayName;parse.argtypes=[wintypes.LPCWSTR,ctypes.c_void_p,ctypes.POINTER(ctypes.c_void_p),wintypes.DWORD,ctypes.POINTER(wintypes.DWORD)];parse.restype=ctypes.c_long
+                find_last=shell32.ILFindLastID;find_last.argtypes=[ctypes.c_void_p];find_last.restype=ctypes.c_void_p
+                open_select=shell32.SHOpenFolderAndSelectItems;open_select.argtypes=[ctypes.c_void_p,wintypes.UINT,ctypes.POINTER(ctypes.c_void_p),wintypes.DWORD];open_select.restype=ctypes.c_long
+                free=ole32.CoTaskMemFree;free.argtypes=[ctypes.c_void_p];free.restype=None
+                co_initialize=ole32.CoInitializeEx;co_initialize.argtypes=[ctypes.c_void_p,wintypes.DWORD];co_initialize.restype=ctypes.c_long
+                co_uninitialize=ole32.CoUninitialize;co_uninitialize.argtypes=[];co_uninitialize.restype=None
+                com_result=co_initialize(None,2)
+                if com_result<0 and (com_result & 0xffffffff)!=0x80010106:raise OSError(f'COM initialization failed (0x{com_result & 0xffffffff:08X})')
+                def parse_pidl(shell_path):
+                    pidl=ctypes.c_void_p();hr=parse(shell_path,None,ctypes.byref(pidl),0,None)
+                    if hr!=0:raise OSError(f'SHParseDisplayName failed (0x{hr & 0xffffffff:08X})')
+                    return pidl
+                folder_pidl=ctypes.c_void_p();item_pidl=ctypes.c_void_p()
+                try:
+                    folder_pidl=parse_pidl(str(Path(target).parent));item_pidl=parse_pidl(target)
+                    relative_item=find_last(item_pidl)
+                    if not relative_item:raise OSError('Could not identify the selected item in its parent folder')
+                    items=(ctypes.c_void_p*1)(relative_item);hr=open_select(folder_pidl,1,items,0)
+                    if hr!=0:raise OSError(f'SHOpenFolderAndSelectItems failed (0x{hr & 0xffffffff:08X})')
+                finally:
+                    if item_pidl:free(item_pidl)
+                    if folder_pidl:free(folder_pidl)
+                    if com_result>=0:co_uninitialize()
             elif sys.platform=='darwin':subprocess.Popen(['open','-R',target])
             else:subprocess.Popen(['xdg-open',str(Path(target).parent)])
         except Exception as e:
+            if sys.platform.startswith('win'):
+                try:
+                    logger.exception('Windows could not select %s in Explorer; opening its containing folder instead',path)
+                    explorer=os.path.join(os.environ.get('WINDIR',r'C:\Windows'),'explorer.exe');subprocess.Popen([explorer,str(Path(path).expanduser().resolve(strict=False).parent)]);return
+                except Exception:logger.exception('Could not open the containing folder for %s',path)
             logger.exception('Could not reveal %s',path)
             QMessageBox.warning(self,'Reveal failed',str(e))
 
@@ -3001,12 +3736,17 @@ class Explorer(QMainWindow):
         """Drop cached totals for affected folders and their ancestors."""
         changed=False
         for raw in paths:
-            folder=Path(raw).parent
+            target=Path(raw);matches=self.grid.items_by_path.get(str(target),())
+            is_directory=bool(matches and matches[0].get('is_dir')) or target.is_dir()
+            folder=target if is_directory else target.parent
             while True:
                 key=str(folder)
                 self.grid.folder_size_queued.discard(key)
                 for futures in (self.grid.folder_size_futures,self.grid.hover_folder_size_futures):
                     future=futures.pop(key,None)
+                    events=self.grid.folder_size_events if futures is self.grid.folder_size_futures else self.grid.hover_folder_size_events
+                    cancel_event=events.pop(key,None)
+                    if cancel_event is not None:cancel_event.set()
                     if future is not None:future.cancel()
                 if key in self.grid.folder_size_cache or key in self.pinned_folder_sizes or key in self.pinned_folder_sizes_checked:
                     self.grid.folder_size_cache.pop(key,None);self.grid.folder_size_cache_checked_at.pop(key,None)
@@ -3026,6 +3766,9 @@ class Explorer(QMainWindow):
             path=str(raw)
             if path and not path.startswith('favgroup://') and path not in unique and Path(path).exists():unique.append(path)
         if not unique:return False
+        self.begin_operation('Moving items to the Recycle Bin…')
+        self.activity_overlay.set_operation('Moving items to the Recycle Bin…');self.position_activity_overlay()
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
         try:
             favorites_snapshot=(set(self.favorites),copy.deepcopy(self.favorite_groups)) if self.in_favorites_view else None
             try:
@@ -3066,6 +3809,7 @@ class Explorer(QMainWindow):
         except Exception as e:
             logger.exception('Could not move selected items to the Recycle Bin')
             QMessageBox.warning(self,'Move to Recycle Bin failed',str(e));return False
+        finally:self.finish_operation()
 
     def remove_favorites_selection(self):
         paths=list(self.grid.selected_paths)
@@ -3201,7 +3945,7 @@ class Explorer(QMainWindow):
 
     def update_favorite_button(self):
         if hasattr(self,'favorites_list_btn'):
-            self.favorites_list_btn.setText('☆');self.favorites_list_btn.setToolTip('Show favorite folders')
+            self.favorites_list_btn.setText('☆');self.favorites_list_btn.setToolTip('Exit Favorites' if self.in_favorites_view else 'Show favorite folders')
         if hasattr(self,'farviewbtn'):
             self.farviewbtn.setToolTip('Create a Farview tab from the selected files and folders' if getattr(getattr(self,'grid',None),'selected_paths',set()) else f'Create a Farview tab from {self.current} and its image subfolders')
 
@@ -3219,8 +3963,8 @@ class Explorer(QMainWindow):
         targets=[key]
         try:
             targets.extend(str(e.path) for e in os.scandir(root) if e.is_dir() and (not e.name.startswith('.') or e.name.startswith('. ')))
-        except Exception:
-            pass
+        except OSError:
+            logger.warning('Could not scan child folders while pinning %s',root,exc_info=True)
         for target in targets:
             if target in self.grid.folder_size_cache:
                 self.pinned_folder_sizes[target]=max(0,int(self.grid.folder_size_cache[target]))
@@ -3232,62 +3976,186 @@ class Explorer(QMainWindow):
                 self.grid.folder_cache[target]=cached
                 continue
             self.pinned_thumbs.setdefault(target,None)
-            if target in self.grid.folder_futures or target in self.grid.folder_cache:
+            if target in self.grid.folder_cache:
+                source=self.grid.folder_cache[target]
+                if source:
+                    fut=self.grid.folder_pool.submit(self.grid.persist_folder_thumb,target,source)
+                    def persisted(f,pp=target):
+                        try:
+                            cached=f.result()
+                            if cached:self._folder_thumb_bridge.completed.emit(pp,cached)
+                        except Exception:
+                            if not f.cancelled():logger.exception('Could not persist pinned folder thumbnail for %s',pp)
+                    fut.add_done_callback(persisted)
                 continue
-            fut=self.grid.folder_pool.submit(self.grid.folder_image,target)
+            existing=self.grid.folder_futures.get(target)
+            if existing is not None:
+                def persist_existing(f,pp=target):
+                    try:
+                        source=f.result()
+                        cached=self.grid.persist_folder_thumb(pp,source) if source else None
+                        if cached:self._folder_thumb_bridge.completed.emit(pp,cached)
+                    except Exception:
+                        if not f.cancelled():logger.exception('Could not persist pinned folder thumbnail for %s',pp)
+                existing.add_done_callback(persist_existing)
+                continue
+            fut=self.grid.folder_pool.submit(self.grid.resolve_folder_thumbnail,target)
             def done(f,pp=target):
                 try:
                     val=f.result()
-                    if val:
-                        cached=self.grid.persist_folder_thumb(pp,val)
-                        if cached:
-                            self.pinned_thumbs[pp]=cached
-                            self.grid.folder_cache[pp]=cached
-                            self.save_settings();self.schedule_disk_thumbnail_cache_trim()
-                except Exception: pass
+                    if val:self._folder_thumb_bridge.completed.emit(pp,val)
+                except Exception:
+                    if not f.cancelled():logger.exception('Could not cache pinned folder thumbnail for %s',pp)
             fut.add_done_callback(done)
         self.save_settings()
         return True
 
+    def handle_pinned_thumbnail_ready(self,path,thumbnail_path):
+        if self._closing or not thumbnail_path:return
+        if path not in self.pinned_folders:
+            cache_path=self.grid._persistent_folder_thumb_path(path)
+            if cache_path:
+                try:cache_path.unlink(missing_ok=True)
+                except OSError:logger.debug('Could not remove stale pinned thumbnail %s',cache_path,exc_info=True)
+            return
+        self.pinned_thumbs[path]=str(thumbnail_path);self.grid.folder_cache[path]=str(thumbnail_path)
+        self.save_settings();self.schedule_disk_thumbnail_cache_trim()
+
+    def style_manager_dialog(self,dialog):
+        dialog.setStyleSheet('''
+            QDialog{background:#1b1d20;color:#eeeeee;}
+            QLabel{color:#e6e6e6;}
+            QLineEdit,QListWidget,QComboBox{background:#202226;color:#eeeeee;border:1px solid #46484d;border-radius:3px;padding:7px;}
+            QListWidget::item{padding:7px 5px;}
+            QListWidget::item:selected{background:#51441d;color:#ffffff;}
+            QPushButton,QToolButton{background:#292b30;color:#eeeeee;border:1px solid #494b51;border-radius:3px;padding:7px 13px;min-height:20px;}
+            QPushButton:hover,QToolButton:hover{background:#393b40;border-color:#c49a28;}
+            QPushButton:checked{background:#51441d;border-color:#c49a28;color:#ffffff;}
+            QPushButton:disabled{color:#777777;border-color:#333333;}
+        ''')
+
     def manage_pinned_folders(self):
-        dlg=QDialog(self); dlg.setWindowTitle('Keep folder thumbnails'); dlg.resize(700,430); lay=QVBoxLayout(dlg)
-        info=QLabel("Add folders whose thumbnails should be kept permanently in Magellan's local thumbnail cache."); info.setWordWrap(True); lay.addWidget(info)
-        path_row=QHBoxLayout(); path_edit=QLineEdit(); path_edit.setPlaceholderText(r'Enter a full folder path, e.g. H:\Pictures'); browse=QToolButton(); browse.setText('Browse…'); add_path=QToolButton(); add_path.setText('Add path'); path_row.addWidget(path_edit,1); path_row.addWidget(browse); path_row.addWidget(add_path); lay.addLayout(path_row)
-        lay.addWidget(QLabel('Pinned folders')); current=QListWidget(); current.setToolTip("These folders keep a local thumbnail copy inside Magellan's installation folder."); lay.addWidget(current,1)
+        dlg=QDialog(self);dlg.setWindowTitle('Keep folder thumbnails');dlg.resize(850,540);self.style_manager_dialog(dlg);lay=QVBoxLayout(dlg);lay.setSpacing(10)
+        info=QLabel("Keep selected folders' thumbnails in Magellan's local cache. Their immediate child folders are included; deeper subfolders must be added separately.");info.setWordWrap(True);lay.addWidget(info)
+        path_row=QHBoxLayout();path_edit=QLineEdit();path_edit.setPlaceholderText(r'Enter a full folder path, e.g. H:\Pictures');browse=QPushButton('Browse…');add_path=QPushButton('Add path');path_row.addWidget(path_edit,1);path_row.addWidget(browse);path_row.addWidget(add_path);lay.addLayout(path_row)
+        sort_row=QHBoxLayout();search=QLineEdit();search.setPlaceholderText('Search pinned folder paths…');sort_row.addWidget(search,1);sort_row.addWidget(QLabel('Sort by'));sort_by=QComboBox();sort_by.addItems(['Path','Date created']);sort_row.addWidget(sort_by)
+        ascending=QPushButton('Ascending ↑');ascending.setCheckable(True);descending=QPushButton('Descending ↓');descending.setCheckable(True);sort_row.addWidget(ascending);sort_row.addWidget(descending);sort_row.addStretch(1);lay.addLayout(sort_row)
+        lay.addWidget(QLabel('Pinned folders'));current=QListWidget();current.setSelectionMode(QAbstractItemView.ExtendedSelection);current.setToolTip("These folders keep a local thumbnail copy inside Magellan's installation folder.");lay.addWidget(current,1)
+        descending_order=False
         def populate():
-            current.clear()
-            for x in sorted(self.pinned_folders,key=natural_key): current.addItem(x)
+            current.clear();query=search.text().casefold().strip()
+            paths=[path for path in self.pinned_folders if not query or query in path.casefold()]
+            if sort_by.currentIndex()==1:
+                def created(path):
+                    try:return Path(path).stat().st_ctime
+                    except OSError:return 0
+                paths.sort(key=lambda path:(created(path),natural_key(path)),reverse=descending_order)
+            else:paths.sort(key=natural_key,reverse=descending_order)
+            for path in paths:current.addItem(path)
+            remove_btn.setEnabled(bool(current.count()))
         def add_path_value():
             raw=path_edit.text().strip().strip('"')
-            if not raw: return
-            if not self._pin_folder(raw): QMessageBox.warning(dlg,'Folder not found',f'Folder does not exist:\n{raw}'); return
-            populate(); path_edit.clear()
+            if not raw:return
+            if not self._pin_folder(raw):QMessageBox.warning(dlg,'Folder not found',f'Folder does not exist:\n{raw}');return
+            path_edit.clear();populate()
         def browse_path():
-            f=QFileDialog.getExistingDirectory(dlg,'Choose folder to keep',str(self.current))
-            if f: path_edit.setText(f); add_path_value()
+            folder=QFileDialog.getExistingDirectory(dlg,'Choose folder to keep',str(self.current))
+            if folder:path_edit.setText(folder);add_path_value()
         def remove():
-            it=current.currentItem()
-            if not it: return
-            key=it.text(); self.pinned_folders.discard(key);self._pinned_folders_generation+=1
-            # Remove the root cache and the caches for its immediate child folders.
-            targets=[key]
-            try:
-                root=Path(key)
-                targets.extend(str(e.path) for e in os.scandir(root) if e.is_dir() and (not e.name.startswith('.') or e.name.startswith('. ')))
-            except Exception: pass
-            for target in targets:
-                self.pinned_thumbs.pop(target,None)
-                self.pinned_folder_sizes.pop(target,None)
-                self.pinned_folder_sizes_checked.pop(target,None)
-                self.grid.folder_size_cache_checked_at.pop(target,None)
-                cp=self.grid._persistent_folder_thumb_path(target)
-                if cp:
-                    try: cp.unlink(missing_ok=True)
-                    except Exception: pass
-            self.save_settings(); populate()
-        add_path.clicked.connect(add_path_value); browse.clicked.connect(browse_path)
-        row=QHBoxLayout(); addb=QToolButton(); addb.setText('Add path'); addb.clicked.connect(add_path_value); remb=QToolButton(); remb.setText('Remove selected'); remb.clicked.connect(remove); row.addWidget(addb); row.addWidget(remb); row.addStretch(); lay.addLayout(row)
-        close=QDialogButtonBox(QDialogButtonBox.Close); close.rejected.connect(dlg.reject); close.accepted.connect(dlg.accept); lay.addWidget(close); populate(); dlg.exec()
+            keys=[item.text() for item in current.selectedItems()]
+            if not keys:return
+            for key in keys:
+                self.pinned_folders.discard(key);self._pinned_folders_generation+=1
+                targets=[key]
+                try:
+                    root=Path(key)
+                    targets.extend(str(entry.path) for entry in os.scandir(root) if entry.is_dir() and (not entry.name.startswith('.') or entry.name.startswith('. ')))
+                except Exception:pass
+                for target in targets:
+                    self.pinned_thumbs.pop(target,None);self.pinned_folder_sizes.pop(target,None);self.pinned_folder_sizes_checked.pop(target,None);self.grid.folder_size_cache_checked_at.pop(target,None)
+                    cache_path=self.grid._persistent_folder_thumb_path(target)
+                    if cache_path:
+                        try:cache_path.unlink(missing_ok=True)
+                        except OSError:logger.warning('Could not remove pinned thumbnail cache for %s',target,exc_info=True)
+            self.save_settings();populate()
+        def set_direction(descending_order_value):
+            nonlocal descending_order
+            descending_order=descending_order_value;ascending.setChecked(not descending_order);descending.setChecked(descending_order);populate()
+        add_path.clicked.connect(add_path_value);browse.clicked.connect(browse_path);path_edit.returnPressed.connect(add_path_value);search.textChanged.connect(populate)
+        sort_by.currentIndexChanged.connect(populate);ascending.clicked.connect(lambda:set_direction(False));descending.clicked.connect(lambda:set_direction(True));ascending.setChecked(True)
+        actions=QHBoxLayout();remove_btn=QPushButton('Remove selected');remove_btn.clicked.connect(remove);actions.addWidget(remove_btn);actions.addStretch(1);lay.addLayout(actions)
+        close=QDialogButtonBox(QDialogButtonBox.Close);close.rejected.connect(dlg.reject);close.accepted.connect(dlg.accept);lay.addWidget(close);populate();dlg.exec()
+
+    def manage_personal_orders(self):
+        dlg=QDialog(self);dlg.setWindowTitle('Manage personal orders');dlg.resize(850,540);self.style_manager_dialog(dlg);layout=QVBoxLayout(dlg)
+        info=QLabel('Saved custom orders for folders, Favorites, and Farviews. Removing an order clears its saved sequence.')
+        info.setWordWrap(True);layout.addWidget(info)
+        filters=QHBoxLayout();search=QLineEdit();search.setPlaceholderText('Search paths and views…');filters.addWidget(search,1)
+        sort_by=QComboBox();sort_by.addItems(['Path','Date created']);filters.addWidget(QLabel('Sort by'));filters.addWidget(sort_by)
+        direction=QComboBox();direction.addItems(['Ascending','Descending']);filters.addWidget(direction);layout.addLayout(filters)
+        orders=QListWidget();orders.setSelectionMode(QAbstractItemView.ExtendedSelection);layout.addWidget(orders,1)
+        entries=[]
+        def describe(storage_key):
+            if storage_key=='favorites:root':return 'Favorites root'
+            if storage_key.startswith('favorites:group:'):
+                group_id=storage_key.split(':',2)[2];group=next((g for g in self.favorite_groups if g.get('id')==group_id),None)
+                return 'Favorites group: '+(group.get('name','Group') if group else group_id)
+            if storage_key.startswith('folder:'):return storage_key[len('folder:'):]
+            if storage_key.startswith('farview:'):
+                view_id=storage_key[len('farview:'):];tab=next((t for t in self.tabs if t.get('kind')=='farview' and str(t.get('view_id') or self._normalized_path_key(t.get('path','')))==view_id),None)
+                return 'Farview: '+(str(tab.get('path','')) if tab else view_id)
+            return storage_key
+        def populate():
+            entries.clear()
+            for storage_key,order in self.folder_manual_orders.items():
+                if isinstance(storage_key,str) and isinstance(order,list) and order:
+                    entries.append((storage_key,describe(storage_key),len(order),self.manual_order_created.get(storage_key)))
+            query=search.text().casefold().strip();field=sort_by.currentIndex();reverse=direction.currentIndex()==1
+            visible=[entry for entry in entries if not query or query in entry[1].casefold() or query in entry[0].casefold()]
+            if field==1:
+                visible.sort(key=lambda entry:(entry[3] is None,entry[3] or 0,entry[1].casefold()),reverse=reverse)
+            else:visible.sort(key=lambda entry:entry[1].casefold(),reverse=reverse)
+            orders.clear()
+            for storage_key,label,count,created in visible:
+                try:date_label=datetime.fromtimestamp(created).strftime('%Y-%m-%d %H:%M') if created else 'date unavailable'
+                except (OverflowError,OSError,ValueError):date_label='date unavailable'
+                item=QListWidgetItem(f'{label}   ·   {count} items   ·   {date_label}');item.setData(Qt.UserRole,storage_key);orders.addItem(item)
+            remove_selected.setEnabled(orders.count()>0)
+        def reset_order_users(keys,all_orders=False):
+            if all_orders:
+                for key in list(self.folder_sort_settings):
+                    if self.folder_sort_settings.get(key,{}).get('sort')=='manual':self.folder_sort_settings[key]={'sort':'name','desc':False}
+                for tab in self.tabs:
+                    if tab.get('sort')=='manual':tab.update({'sort':'name','desc':False,'unsorted':False})
+                if self.sort=='manual':self.sort='name';self.desc=False
+            else:
+                for key in keys:
+                    if key.startswith('folder:'):
+                        path_key=key[len('folder:'):]
+                        setting=self.folder_sort_settings.get(path_key)
+                        if isinstance(setting,dict) and setting.get('sort')=='manual':self.folder_sort_settings[path_key]={'sort':'name','desc':False}
+                        for tab in self.tabs:
+                            if tab.get('kind')!='farview' and self._normalized_path_key(tab.get('path',''))==path_key and tab.get('sort')=='manual':tab.update({'sort':'name','desc':False})
+                    elif key.startswith('farview:'):
+                        view_id=key[len('farview:'):]
+                        for tab in self.tabs:
+                            if tab.get('kind')=='farview' and str(tab.get('view_id') or self._normalized_path_key(tab.get('path','')))==view_id and tab.get('sort')=='manual':tab.update({'sort':'name','desc':False})
+                if self._manual_view_key() in keys and self.sort=='manual':self.sort='name';self.desc=False
+        def remove_keys(keys,all_orders=False):
+            for storage_key in keys:
+                self.folder_manual_orders.pop(storage_key,None);self.manual_order_created.pop(storage_key,None)
+            if all_orders:self.manual_order_created.clear()
+            reset_order_users(keys,all_orders)
+            self.update_sort_buttons();self.refresh();self.save_settings();populate()
+        actions=QHBoxLayout();remove_selected=QPushButton('Exclude selected');clear_all=QPushButton('Exclude all');actions.addWidget(remove_selected);actions.addWidget(clear_all);actions.addStretch();layout.addLayout(actions)
+        remove_selected.clicked.connect(lambda:remove_keys([str(item.data(Qt.UserRole)) for item in orders.selectedItems()]))
+        def confirm_exclude_all():
+            if not self.folder_manual_orders:return
+            answer=QMessageBox.question(dlg,'Exclude all personal orders','Remove all saved personal orders? This cannot be undone.',QMessageBox.Yes|QMessageBox.Cancel,QMessageBox.Cancel)
+            if answer==QMessageBox.Yes:remove_keys(list(self.folder_manual_orders),all_orders=True)
+        clear_all.clicked.connect(confirm_exclude_all)
+        search.textChanged.connect(populate);sort_by.currentIndexChanged.connect(populate);direction.currentIndexChanged.connect(populate)
+        close=QDialogButtonBox(QDialogButtonBox.Close);close.rejected.connect(dlg.reject);close.accepted.connect(dlg.accept);layout.addWidget(close);populate();dlg.exec()
 
     def choose_search_provider(self):
         items=['SauceNAO','Google Images / Lens']
@@ -3327,14 +4195,28 @@ class Explorer(QMainWindow):
         QTimer.singleShot(60000,lambda p=str(bridge):cleanup_search_bridge(p))
 
     def perform_image_search(self,path):
+        generated_upload=None
         try:
-            upload_path=Path(path)
+            original_path=Path(path);upload_path=original_path;upload_name=original_path.name
             if upload_path.suffix.lower() in VIDEO_EXTS:
                 img=self.grid.video_thumbnail_worker(str(upload_path),1200,1200)
                 if img is None or img.isNull(): raise RuntimeError('Could not extract a frame from the video.')
-                fd,tmp=tempfile.mkstemp(suffix='.jpg',prefix='magellan_search_');os.close(fd)
-                upload_path=Path(tmp)
+                fd,generated_upload=tempfile.mkstemp(suffix='.jpg',prefix='magellan_search_');os.close(fd)
+                upload_path=Path(generated_upload);upload_name=original_path.stem+'.jpg'
                 if not img.save(str(upload_path),'JPEG',92): raise RuntimeError('Could not create the search image.')
+            else:
+                try:source_bytes=upload_path.stat().st_size
+                except OSError as exc:raise RuntimeError(f'Cannot read the selected image: {exc}') from exc
+                reader=QImageReader(str(upload_path));reader.setAutoTransform(True);reader.setDecideFormatFromContent(True);source_size=reader.size()
+                if source_bytes>25*1024*1024 or (source_size.isValid() and source_size.width()*source_size.height()>48_000_000):
+                    if not source_size.isValid():raise RuntimeError('This image is too large to prepare for search because its dimensions could not be read.')
+                    factor=min(1.0,2560/max(source_size.width(),source_size.height()),(24_000_000/(source_size.width()*source_size.height()))**0.5)
+                    reader.setScaledSize(QSize(max(1,round(source_size.width()*factor)),max(1,round(source_size.height()*factor))))
+                    image=reader.read()
+                    if image.isNull():raise RuntimeError(f'Could not prepare this large image: {reader.errorString()}')
+                    fd,generated_upload=tempfile.mkstemp(suffix='.jpg',prefix='magellan_search_');os.close(fd)
+                    upload_path=Path(generated_upload)
+                    if not image.save(str(upload_path),'JPEG',90):raise RuntimeError('Could not prepare the large image for search.')
             provider=self.image_search_provider
             self.status.setText(f'Searching with {"SauceNAO" if provider=="saucenao" else "Google Lens"}…')
             self.grid.setFocus()
@@ -3345,6 +4227,7 @@ class Explorer(QMainWindow):
                 # the user's browser and let the browser submit the multipart form itself.
                 raw=upload_path.read_bytes()
                 b64=base64.b64encode(raw).decode('ascii')
+                b64_js=javascript_literal(b64);name_js=javascript_literal(upload_name)
                 stamp=int(time.time()*1000)
                 lens_query=f'&q={quote(self.google_lens_query.strip(),safe="")}' if self.google_lens_query.strip() else ''
                 html=f'''<!doctype html>
@@ -3352,10 +4235,10 @@ class Explorer(QMainWindow):
 <body>
 <script>
 (async()=>{{
-  const b64={json.dumps(b64)};
+  const b64={b64_js};
   const bytes=Uint8Array.from(atob(b64), c=>c.charCodeAt(0));
   const blob=new Blob([bytes], {{type:"image/jpeg"}});
-  const file=new File([blob], {json.dumps(upload_path.name)}, {{type:"image/jpeg"}});
+  const file=new File([blob], {name_js}, {{type:"image/jpeg"}});
   const form=document.createElement("form");
   form.method="POST";
   form.enctype="multipart/form-data";
@@ -3386,15 +4269,15 @@ class Explorer(QMainWindow):
                     self.image_search_mode=False;self.grid.set_image_search_active(False);self.grid.search_hover=-1;self.grid.viewport().update()
                     QMessageBox.information(self,'SauceNAO API key required','SauceNAO API searches require an API key. Add it under Tools → Set SauceNAO API key…')
                     return
-                raw=upload_path.read_bytes(); b64=base64.b64encode(raw).decode('ascii')
+                raw=upload_path.read_bytes(); b64=base64.b64encode(raw).decode('ascii');b64_js=javascript_literal(b64);name_js=javascript_literal(upload_name);api_key_js=javascript_literal(api_key)
                 html=f"""<!doctype html><html><head><meta charset='utf-8'><title>Magellan - SauceNAO</title></head><body><script>
 (async()=>{{
-const bytes=Uint8Array.from(atob({json.dumps(b64)}),c=>c.charCodeAt(0));
+const bytes=Uint8Array.from(atob({b64_js}),c=>c.charCodeAt(0));
 const blob=new Blob([bytes],{{type:'image/jpeg'}});
-const file=new File([blob],{json.dumps(upload_path.name)},{{type:'image/jpeg'}});
+const file=new File([blob],{name_js},{{type:'image/jpeg'}});
 const form=document.createElement('form');form.method='POST';form.enctype='multipart/form-data';form.action='https://saucenao.com/search.php';
 const input=document.createElement('input');input.type='file';input.name='file';const dt=new DataTransfer();dt.items.add(file);input.files=dt.files;form.appendChild(input);
-const key=document.createElement('input');key.type='hidden';key.name='api_key';key.value={json.dumps(api_key)};form.appendChild(key);
+const key=document.createElement('input');key.type='hidden';key.name='api_key';key.value={api_key_js};form.appendChild(key);
 const out=document.createElement('input');out.type='hidden';out.name='output_type';out.value='0';form.appendChild(out);document.body.appendChild(form);form.submit();
 }})().catch(e=>document.body.textContent='Magellan could not start SauceNAO: '+e);</script></body></html>"""
                 self.open_search_bridge(html,'magellan_saucenao_')
@@ -3405,11 +4288,22 @@ const out=document.createElement('input');out.type='hidden';out.name='output_typ
             QMessageBox.warning(self,'Image search failed',str(e))
         finally:
             try:
-                if 'tmp' in locals(): os.unlink(tmp)
-            except Exception: pass
+                if generated_upload:os.unlink(generated_upload)
+            except OSError:logger.debug('Could not remove temporary image-search upload %s',generated_upload,exc_info=True)
 
     def toggle_favorites_view(self):
-        self.show_favorites()
+        if not self.in_favorites_view:
+            self.show_favorites();return
+        if self.active_favorite_group is not None:
+            self.show_favorites();return
+        target=self.favorites_return_path
+        self.in_favorites_view=False;self.active_favorite_group=None;self.return_to_favorites=False
+        if target:
+            for i,tab in enumerate(self.tabs):
+                if self._normalized_path_key(tab.get('path',''))==self._normalized_path_key(target):
+                    self.tabbar.setCurrentIndex(i);self.activate_tab(i,save_previous=False);return
+            if Path(target).is_dir():self.load(Path(target),restore_scroll=True);return
+        self.back()
     def show_favorites(self,group_id=None):
         if not self.in_favorites_view:self.save_current_view();self.favorites_return_path=str(self.current)
         self.in_favorites_view=True;self.return_to_favorites=False;self.active_favorite_group=group_id
@@ -3460,17 +4354,32 @@ const out=document.createElement('input');out.type='hidden';out.name='output_typ
 
     def show_controls_help(self):
         dlg=QDialog(self);dlg.setWindowTitle('Magellan controls');dlg.resize(690,690);layout=QVBoxLayout(dlg)
-        content=QLabel('''<h2>Navigation and selection</h2>
-<ul><li>Left-click a thumbnail to open a folder or view a file. Left-click its name to open the folder in File Explorer or reveal a file there.</li><li>Right-click or press Backspace to go back/up. Middle-click a folder to open it in a new tab.</li><li>Alt+left-click reveals the item in its containing folder.</li><li>Shift+left-drag draws a selection rectangle. Ctrl+left-click toggles individual selections. Drag near the top or bottom edge to auto-scroll.</li><li>Enter or Space opens the keyboard-highlighted item. Arrow keys move the highlight; holding an arrow accelerates. Mouse movement returns navigation to the pointer.</li><li>Tab / Shift+Tab switches tabs. Keys 1–6 choose the sorting mode. Q focuses search; press Q again to return to keyboard navigation.</li><li>Ctrl+Z undoes the latest selection change or deletion. Shift+Delete sends selected items to the Recycle Bin.</li><li>In Favorites, Delete removes selected entries. Hold Ctrl to enable organization and drag selected items into a group; releasing Ctrl disables organization. Double-click a group name to rename it.</li></ul>
-<h2>Viewer</h2>
-<ul><li>Left and right arrow keys, or Q and E, show the previous and next image. Holding a navigation key accelerates after a moment.</li><li>Click the left or right edge to change images. Right-click or press Escape / Up to close the viewer.</li><li>Double-click to toggle zoom. Use the mouse wheel to zoom at the pointer, then drag to pan.</li><li>R rotates clockwise; F flips horizontally; G fits the image; H toggles slideshow; minus / equals zoom out/in; WASD pans.</li><li>Hover near the top for image details and near the bottom for viewer controls. The bottom buttons rotate, flip, fit, toggle side-by-side pages, and toggle slideshow.</li></ul>
-<h2>Thumbnail and panels</h2>
-<ul><li>Hover a thumbnail for file details and its Favorites control. Hover the right edge for selection controls and Favorites group controls.</li><li>When auto-hide is enabled, move to the top edge for the main panel or the left edge for the file tree. The file tree has an × button to close it.</li><li>Use the search field to filter the current folder; recursive search can be enabled in Performance.</li></ul>''')
+        content=QLabel('''<h2>Navigation and tabs</h2>
+<ul><li>Left-click a thumbnail to open a folder or view a file. Click a thumbnail name to open its folder in File Explorer or reveal the file there. Alt+left-click reveals an item at its exact location.</li><li>Right-click or Backspace goes up/back. The Back button returns to the previous location. Middle-click a folder to open it in a new tab.</li><li>Tab / Shift+Tab switches tabs. Drag a tab to reorder it. Hold Ctrl and click tabs to select multiple tabs for coloring; right-click a tab for its outline color menu. Scroll over the tab strip to move sideways.</li><li>When enabled, Hide tabs with the main bar hides the navigation strip, path, and status area with the main panel. Moving to the top reveals the panel; it stays open briefly after opening a tab.</li></ul>
+<h2>Keyboard and selection</h2>
+<ul><li>Arrow keys move the keyboard highlight; holding an arrow accelerates. Enter or Space opens the highlighted item. Mouse movement returns navigation to the pointer. Q toggles focus between search and keyboard navigation.</li><li>Shift+drag draws a selection rectangle and toggles items inside it. Drag near the top or bottom edge to auto-scroll. Selection remains while you navigate between folders.</li><li>Ctrl+A selects all items on the current page. If all are already selected it clears them; if only some are selected it selects the rest. Right-side buttons select all, clear selection, or undo the last deselection.</li><li>Ctrl+Z undoes the latest selection change or deletion. Shift+Delete sends selected files and folders to the Recycle Bin.</li><li>Hold Ctrl while dragging to enable organization mode. Release Ctrl to leave it. You can drag one or multiple items between thumbnails and Favorites groups.</li></ul>
+<h2>Favorites and Farview</h2>
+<ul><li>The Favorites button opens Favorites; from a group or subfolder it returns to the Favorites root, and from the root it exits Favorites. Use the plus on a thumbnail to add it to Favorites or choose a group.</li><li>In Favorites, Delete removes selected entries. Double-click a group name to rename it. Groups stay at the top of the Favorites list.</li><li>Farview creates a tab that lines up images/files found in subfolders. It can be created from a folder or selection, and multiple Farview tabs can use different sorting. The Personal order sort uses a saved custom sequence when one exists.</li><li>Use Manage personal orders to search, sort, or remove saved sequences. Excluded paths are listed in the personal-order settings.</li></ul>
+<h2>Sorting and search</h2>
+<ul><li>Keys 1–6 select Name, Last modified, Last created, Type, Size, and Random sorting. The direction indicator switches ascending and descending. Personal order applies a custom sequence for the current folder or view.</li><li>Use the search field to filter items. Recursive search can be enabled in Performance. The clear button empties the search. Tools → Scroll behavior sets rows per wheel notch (including fractional rows) and optional momentum.</li></ul>
+<h2>Image viewer</h2>
+<ul><li>Left / right arrows or Q / E show the previous / next image. Holding a navigation key accelerates. Click the left or right edge to change images.</li><li>Right-click, Escape, or Up closes the viewer. Double-click toggles zoom. The wheel zooms at the pointer; drag to pan.</li><li>R rotates clockwise; F flips horizontally; G fits the image; H toggles slideshow; minus / equals zoom out/in; WASD pans. Delete sends the current image to the Recycle Bin.</li><li>Use the bottom controls for rotate, flip, fit, side-by-side pages, and slideshow. Hover the top area for image details.</li></ul>
+<h2>Thumbnails and panels</h2>
+<ul><li>Hover a thumbnail for size/date details and its Favorites control. Hover the right edge for selection and group controls.</li><li>When auto-hide is enabled, move to the top edge for the main panel or the left edge for File Tree. The tree remembers its open paths and selected location; use its × button to close it.</li><li>Performance settings include recursive search, thumbnail cache controls, and other resource limits. View settings control thumbnail details and panel auto-hide behavior.</li></ul>''')
         content.setWordWrap(True);content.setTextFormat(Qt.RichText);content.setMargin(14)
         scroll=QScrollArea(dlg);scroll.setWidgetResizable(True);scroll.setWidget(content);layout.addWidget(scroll)
         buttons=QDialogButtonBox(QDialogButtonBox.Close);buttons.rejected.connect(dlg.reject);layout.addWidget(buttons);dlg.exec()
 
 if __name__=='__main__':
-    app=QApplication(sys.argv);app.setStyle('Fusion');w=Explorer();w.show();sys.exit(app.exec())
+    app=QApplication(sys.argv);app.setStyle('Fusion')
+    lock_dir=Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation));lock_dir.mkdir(parents=True,exist_ok=True)
+    _INSTANCE_LOCK=QLockFile(str(lock_dir/'magellan-instance.lock'))
+    if not _INSTANCE_LOCK.tryLock(0):
+        if _INSTANCE_LOCK.error()==QLockFile.LockFailedError:
+            QMessageBox.warning(None,'Magellan is already running','Another Magellan instance is still running. Close it in Task Manager before starting another copy. If it has already exited, wait a moment and try again.')
+        else:
+            QMessageBox.warning(None,'Magellan could not start','Magellan could not create its single-instance lock file. Check that the application settings folder is writable.')
+        sys.exit(0)
+    w=Explorer();w.show();sys.exit(app.exec())
 
 
