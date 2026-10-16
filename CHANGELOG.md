@@ -12,7 +12,7 @@
 - Added a bounded cache for composed thumbnail cards that shares the configured memory budget with decoded thumbnails.
 - Improved Farview and personal ordering, including support for inheriting the source folder’s custom order.
 - Preserved file-tree expansion, selection, and scroll state more reliably, and added clearer progress and selection-size feedback for longer operations.
-- Added recursive-search, Lens text-query, tab scrolling/color, and thumbnail-cache location/size controls.
+- Added tab reorganization via dragging, and thumbnail-cache location/size controls.
 - TOOLS > Scroll behavior now lets you set rows per wheel notch and toggle smooth momentum. (Smooth scrolling is still experimental)
 - Updated HELP to match the new commands and behavior.
 - Many minor fixes.
