@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — 2026-10-18
+
+- Added a configurable automatic folder refresh in **View**. It scans at low priority, defers applying results while the user is scrolling or selecting, and preserves the current navigation state.
+- Added a **Help** toggle for scroll diagnostic logging; it remains disabled by default. Pressing `7` now selects Personal order.
+- Reworked smooth wheel scrolling to keep its initial momentum and extend the slide before easing to a stop.
+- Improved image-viewer preloading and moved file-size reads off the UI thread; retained original file metadata in the viewer cache.
+- Made viewer shutdown cleanup more defensive to reduce lingering image locks and close-time errors.
+
 ## Unreleased — 2026-10-15
 
 - Organization mode now works in regular folders, Farview, and Favorites.

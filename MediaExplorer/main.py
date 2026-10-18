@@ -25,7 +25,7 @@ try:
 except Exception:
     imageio_ffmpeg=None
 
-from PySide6.QtCore import Qt, QSize, QSizeF, QRect, QRectF, QPoint, QPointF, Signal, QObject, QThread, QStandardPaths, QTimer, QDir, QEvent, QMimeData, QEventLoop, QLockFile
+from PySide6.QtCore import Qt, QSize, QSizeF, QRect, QRectF, QPoint, QPointF, Signal, QObject, QThread, QStandardPaths, QTimer, QDir, QEvent, QMimeData, QEventLoop, QLockFile, QAbstractAnimation, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QFontMetricsF, QCursor, QImage, QImageReader, QIcon, QMovie, QDrag
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (
@@ -159,7 +159,7 @@ class FolderThumbnailBridge(QObject):
 def decode_viewer_image(path,preview_size,max_dimension=8000,max_file_bytes=100*1024*1024,preload=False):
     suffix=Path(path).suffix.casefold()
     try:file_size=Path(path).stat().st_size
-    except OSError:return QImage(),QImage(),False,QSize()
+    except OSError:return QImage(),QImage(),False,QSize(),None
     cacheable=file_size<=max_file_bytes
     source_size=QSize()
     if suffix not in PDF_EXTS and suffix!='.jxl':
@@ -168,12 +168,12 @@ def decode_viewer_image(path,preview_size,max_dimension=8000,max_file_bytes=100*
             if size.isValid():source_size=QSize(size)
             cacheable=cacheable and (not size.isValid() or max(size.width(),size.height())<=max_dimension)
         except Exception:logger.debug('Could not inspect viewer image dimensions',exc_info=True)
-    if preload and not cacheable:return QImage(),QImage(),False,source_size
+    if preload and not cacheable:return QImage(),QImage(),False,source_size,file_size
     if suffix in PDF_EXTS:
         document=load_pdf_document(path)
-        if document is None or document.pageCount()<1:return QImage(),QImage(),False,source_size
+        if document is None or document.pageCount()<1:return QImage(),QImage(),False,source_size,file_size
         page=document.pagePointSize(0);cacheable=cacheable and max(page.width(),page.height())<=max_dimension
-        if preload and not cacheable:return QImage(),QImage(),False,source_size
+        if preload and not cacheable:return QImage(),QImage(),False,source_size,file_size
         limit=max(1,min(8000,max(preview_size.width(),preview_size.height())*2));ratio=max(.01,page.width()/max(.01,page.height()))
         if ratio>=1:size=QSize(limit,max(1,int(limit/ratio)))
         else:size=QSize(max(1,int(limit*ratio)),limit)
@@ -185,12 +185,12 @@ def decode_viewer_image(path,preview_size,max_dimension=8000,max_file_bytes=100*
             with Image.open(path) as source:
                 cacheable=cacheable and max(source.size)<=max_dimension
                 source_size=QSize(*source.size)
-                if preload and not cacheable:return QImage(),QImage(),False,source_size
+                if preload and not cacheable:return QImage(),QImage(),False,source_size,file_size
                 source=source.convert('RGBA')
                 image=QImage(source.tobytes(),source.width,source.height,source.width*4,QImage.Format_RGBA8888).copy()
         except Exception:
             logger.debug('JPEG XL viewer decode failed',exc_info=True)
-            return QImage(),QImage(),False,source_size
+            return QImage(),QImage(),False,source_size,file_size
     else:
         reader=QImageReader(str(path));reader.setAutoTransform(True);reader.setDecideFormatFromContent(True)
         if not source_size.isValid() and reader.size().isValid():source_size=QSize(reader.size())
@@ -201,13 +201,12 @@ def decode_viewer_image(path,preview_size,max_dimension=8000,max_file_bytes=100*
         image=reader.read()
         if reader.error()==QImageReader.ImageReaderError.InvalidDataError:
             logger.warning('Could not decode viewer image %s: %s',path,reader.errorString())
-            return QImage(),QImage(),False,source_size
-    if image.isNull():return image,image,False,source_size
+            return QImage(),QImage(),False,source_size,file_size
+    if image.isNull():return image,image,False,source_size,file_size
     cacheable=cacheable and max(image.width(),image.height())<=max_dimension
     preview=image if image.width()<=preview_size.width() and image.height()<=preview_size.height() else image.scaled(preview_size,Qt.KeepAspectRatio,Qt.SmoothTransformation)
     if not source_size.isValid():source_size=image.size()
-    return image,preview,cacheable,source_size
-
+    return image,preview,cacheable,source_size,file_size
 
 
 QSS='''
@@ -442,6 +441,9 @@ class VirtualGrid(QAbstractScrollArea):
         self.selected_paths=set();self.selected_metadata={};self.selection_undo=[];self.selection_dragging=False;self.selection_drag_moved=False;self.selection_anchor=None;self.selection_current=None;self.selection_base=set();self.last_mouse_pos=QPoint();self.navigation_index=-1;self.navigation_key=None;self.navigation_started=0.0
         self.selection_scroll_accumulator=0.0;self.selection_scroll_timer=QTimer(self);self.selection_scroll_timer.setInterval(16);self.selection_scroll_timer.timeout.connect(self.auto_scroll_selection)
         self.wheel_scroller=QScroller.scroller(self);wheel_properties=self.wheel_scroller.scrollerProperties();wheel_properties.setScrollMetric(QScrollerProperties.FrameRate,QScrollerProperties.Standard);wheel_properties.setScrollMetric(QScrollerProperties.VerticalOvershootPolicy,QScrollerProperties.OvershootAlwaysOff);self.wheel_scroller.setScrollerProperties(wheel_properties)
+        self.smooth_scroll_animation=QPropertyAnimation(self.verticalScrollBar(),b'value',self);self.smooth_scroll_target=0
+        scroll_curve=QEasingCurve(QEasingCurve.BezierSpline);scroll_curve.addCubicBezierSegment(QPointF(.15,.35),QPointF(.65,.98),QPointF(1,1));self.smooth_scroll_animation.setEasingCurve(scroll_curve)
+        self._scroll_diagnostic=None
         self.thumb_timer=QTimer(self);self.thumb_timer.timeout.connect(self.poll_async);self.thumb_timer.start(60)
         self.scroll_settle_timer=QTimer(self);self.scroll_settle_timer.setSingleShot(True);self.scroll_settle_timer.timeout.connect(self.scroll_settled)
         self.hover_delay_timer=QTimer(self);self.hover_delay_timer.setSingleShot(True);self.hover_delay_timer.timeout.connect(self.begin_hover_animation)
@@ -453,6 +455,8 @@ class VirtualGrid(QAbstractScrollArea):
 
     def setItems(self,items,reset_scroll=True):
         if hasattr(self,'wheel_scroller'):self.wheel_scroller.stop()
+        if hasattr(self,'smooth_scroll_animation'):
+            self.smooth_scroll_animation.stop();self.smooth_scroll_target=self.verticalScrollBar().value()
         self.set_hover_index(-1)
         self.navigation_index=-1
         # Navigating to a new view should never leave old folder-discovery jobs ahead of the new viewport.
@@ -564,7 +568,7 @@ class VirtualGrid(QAbstractScrollArea):
         if self._closing:return
         self._closing=True
         for timer in (self.thumb_timer,self.scroll_settle_timer,self.hover_delay_timer,self.hover_animation_timer,self.favorite_picker_delay,self.favorite_click_timer,self.group_rename_timer,self.selection_scroll_timer):timer.stop()
-        self.wheel_scroller.stop()
+        self.wheel_scroller.stop();self.smooth_scroll_animation.stop()
         for events in (self.folder_size_events,self.hover_folder_size_events):
             for event in events.values():event.set()
             events.clear()
@@ -589,11 +593,12 @@ class VirtualGrid(QAbstractScrollArea):
         self.verticalScrollBar().setRange(0,max(0,h-self.viewport().height()));self.verticalScrollBar().setPageStep(self.viewport().height());self.viewport().update()
     def resizeEvent(self,e):self.recalc();super().resizeEvent(e)
     def scrollContentsBy(self,dx,dy):
-        # Move the already-rendered viewport and let Qt repaint only the
-        # newly exposed strip. This matters especially during smooth scrolling:
-        # fully repainting every visible card on every animation frame causes
-        # avoidable main-thread work and makes the animation stutter.
+        # Move the existing viewport and let Qt repaint only the newly exposed
+        # strip. Repainting all cards for each animation frame increased paint
+        # cost without removing the reported tearing.
+        started=time.perf_counter() if self._scroll_diagnostic is not None else None
         self.viewport().scroll(dx,dy)
+        if started is not None:self._scroll_diagnostic['shift_ms'].append((time.perf_counter()-started)*1000)
     def wheelEvent(self,e):
         delta=e.angleDelta().y()
         if delta:
@@ -601,15 +606,19 @@ class VirtualGrid(QAbstractScrollArea):
         else:
             distance=-e.pixelDelta().y()*max(.1/3.0,min(4.0,float(getattr(self.explorer(),'wheel_scroll_rows',1))/3.0))
         if distance:
+            self.begin_scroll_diagnostic()
+            if self._scroll_diagnostic is not None:self._scroll_diagnostic['wheel_events']+=1
             if getattr(self.explorer(),'smooth_wheel_scroll',False):
-                bar=self.verticalScrollBar();state=self.wheel_scroller.state()
-                base=self.wheel_scroller.finalPosition().y() if state!=QScroller.Inactive else bar.value()
+                bar=self.verticalScrollBar();animation=self.smooth_scroll_animation
+                animation_active=animation.state()==QAbstractAnimation.Running
+                base=self.smooth_scroll_target if animation_active else bar.value()
                 target=max(0,min(bar.maximum(),base+distance))
-                duration=max(180,min(600,int(180+abs(distance)*.25)))
-                self.wheel_scroller.scrollTo(QPointF(0,target),duration)
+                if target!=base:
+                    animation.stop();animation.setDuration(max(380,min(1050,int(380+abs(target-bar.value())*.28))))
+                    animation.setStartValue(bar.value());animation.setEndValue(round(target));self.smooth_scroll_target=target;animation.start()
             else:
-                self.wheel_scroller.stop()
-                bar=self.verticalScrollBar();bar.setValue(bar.value()+round(distance))
+                self.stop_smooth_scroll()
+                bar=self.verticalScrollBar();bar.setValue(bar.value()+round(distance));self.smooth_scroll_target=bar.value()
         self.setFocus();e.accept()
     def event(self,e):
         if e.type()==QEvent.ScrollPrepare:
@@ -617,15 +626,28 @@ class VirtualGrid(QAbstractScrollArea):
             e.setContentPosRange(QRectF(0,0,0,self.verticalScrollBar().maximum()))
             e.setContentPos(QPointF(0,self.verticalScrollBar().value()));e.accept();return True
         if e.type()==QEvent.Scroll:
+            diag=self._scroll_diagnostic
+            if diag is not None:
+                stamp=time.perf_counter()
+                diag['qscroll_events']+=1
+                if diag['last_qscroll'] is not None:diag['qscroll_gaps_ms'].append((stamp-diag['last_qscroll'])*1000)
+                diag['last_qscroll']=stamp
             position=e.contentPos().y();self.verticalScrollBar().setValue(max(0,min(self.verticalScrollBar().maximum(),round(position))))
             e.accept();return True
         return super().event(e)
-    def stop_smooth_scroll(self):self.wheel_scroller.stop()
+    def stop_smooth_scroll(self):
+        self.wheel_scroller.stop();self.smooth_scroll_animation.stop();self.smooth_scroll_target=self.verticalScrollBar().value()
     def visible_range(self):
         top=self.verticalScrollBar().value(); bottom=top+self.viewport().height()
         if self.mode=='horizontal':return max(0,top//self.row_h-1),min(len(self.items),(bottom//self.row_h)+2)
         first=max(0,top//self.row_h*self.columns-self.columns); last=min(len(self.items),((bottom//self.row_h)+2)*self.columns);return first,last
     def paintEvent(self,e):
+        diag=self._scroll_diagnostic
+        paint_started=time.perf_counter() if diag is not None else None
+        if diag is not None:
+            if diag['last_paint'] is not None:diag['paint_gaps_ms'].append((paint_started-diag['last_paint'])*1000)
+            diag['last_paint']=paint_started
+        card_started=None;painted_cards=0
         self._visible_cache_keys=set() if not getattr(self.explorer(),'thumbnail_cache_enabled',True) else None
         p=QPainter(self.viewport());p.fillRect(self.viewport().rect(),QColor('#080a10'))
         if not self.items:
@@ -633,8 +655,10 @@ class VirtualGrid(QAbstractScrollArea):
             p.setPen(QColor('#e5e5e5'));p.setFont(QFont('Segoe UI',20,QFont.DemiBold));p.drawText(QRect(0,area.height()//2-8,area.width(),36),Qt.AlignCenter,'MAGELLAN')
             p.setPen(QColor('#92969d'));p.setFont(QFont('Segoe UI',11));p.drawText(QRect(0,area.height()//2+32,area.width(),32),Qt.AlignCenter,'Choose a folder to get started')
             p.end();self._trim_cache_after_paint()
+            if diag is not None:self.record_scroll_paint(diag,e,paint_started,0,0.0)
             return
         first,last=self.paint_range(e)
+        card_started=time.perf_counter() if diag is not None else None
         region=e.region();cache_enabled=getattr(self.explorer(),'thumbnail_cache_enabled',True)
         paint_indices=[]
         for i in range(first,last):
@@ -644,6 +668,7 @@ class VirtualGrid(QAbstractScrollArea):
             # not intersect the actual update region instead of redrawing the
             # empty space between those strips.
             if not cache_enabled or region.intersects(card_rect):paint_indices.append(i)
+        painted_cards=len(paint_indices)
         if self.mode=='horizontal':
             for i in paint_indices:self.paint_horizontal(p,i)
         else:
@@ -674,7 +699,17 @@ class VirtualGrid(QAbstractScrollArea):
                 row,col=divmod(i,self.columns);x=9+col*(self.cell_w+9);y=row*self.row_h-self.verticalScrollBar().value();preview=QRect(x+1,y+1,max(1,self.cell_w-2),max(1,self.cell_w-2))
             self.paint_hover_details(p,preview,self.items[i])
         p.end();self._trim_cache_after_paint()
+        if diag is not None:self.record_scroll_paint(diag,e,paint_started,painted_cards,(time.perf_counter()-card_started)*1000 if card_started is not None else 0.0)
 
+    def record_scroll_paint(self,diag,event,started,cards,card_ms):
+        elapsed=(time.perf_counter()-started)*1000
+        rect=event.region().boundingRect()
+        area=max(0,rect.width())*max(0,rect.height())
+        diag['paint_ms'].append(elapsed);diag['card_ms'].append(card_ms);diag['painted_cards']+=cards
+        diag['damage_areas'].append(area)
+        if elapsed>=40:
+            diag['slow_paints'].append((elapsed,rect.width(),rect.height(),cards,len(self.thumb_futures),len(self.folder_futures)))
+            diag['slow_paints']=sorted(diag['slow_paints'],key=lambda row:row[0],reverse=True)[:5]
     def card_rect(self,index):
         if self.mode=='horizontal':
             y=index*self.row_h-self.verticalScrollBar().value()
@@ -897,11 +932,42 @@ class VirtualGrid(QAbstractScrollArea):
         if sizes_changed and size_queue_drained and parent is not None and getattr(parent,'sort',None)=='size':
             QTimer.singleShot(0,parent.refresh)
 
+    def begin_scroll_diagnostic(self):
+        if getattr(self.explorer(),'scroll_test_logging_enabled',False) and self._scroll_diagnostic is None:
+            self._scroll_diagnostic={'mode':'smooth' if getattr(self.explorer(),'smooth_wheel_scroll',False) else 'normal','started':time.perf_counter(),'last_scroll':None,'last_qscroll':None,'last_paint':None,'scroll_gaps_ms':[],'qscroll_gaps_ms':[],'paint_gaps_ms':[],'paint_ms':[],'card_ms':[],'damage_areas':[],'slow_paints':[],'shift_ms':[],'scroll_steps':0,'qscroll_events':0,'wheel_events':0,'painted_cards':0,'cache_hits':0,'cache_misses':0,'card_cache_hits':0,'card_cache_misses':0}
+
+    @staticmethod
+    def diagnostic_stats(samples):
+        if not samples:return (0.0,0.0,0.0)
+        ordered=sorted(samples);p95=ordered[min(len(ordered)-1,int((len(ordered)-1)*.95))]
+        return (sum(ordered)/len(ordered),p95,ordered[-1])
+
+    def finish_scroll_diagnostic(self):
+        diag=self._scroll_diagnostic
+        if diag is None:return
+        elapsed=(time.perf_counter()-diag['started'])*1000
+        paint_avg,paint_p95,paint_max=self.diagnostic_stats(diag['paint_ms'])
+        card_avg,card_p95,card_max=self.diagnostic_stats(diag['card_ms'])
+        shift_avg,shift_p95,shift_max=self.diagnostic_stats(diag['shift_ms'])
+        scroll_gap=self.diagnostic_stats(diag['scroll_gaps_ms'])
+        qscroll_gap=self.diagnostic_stats(diag['qscroll_gaps_ms'])
+        paint_gap=self.diagnostic_stats(diag['paint_gaps_ms'])
+        damage_avg,damage_p95,damage_max=self.diagnostic_stats(diag['damage_areas'])
+        slow=';'.join('%.1fms@%dx%d cards=%d thumbs=%d folders=%d'%row for row in diag['slow_paints']) or 'none'
+        logger.info('Scroll diagnostic mode=%s elapsed_ms=%.0f wheel_events=%d scroll_updates=%d qscroll_events=%d paints=%d painted_cards=%d paint_ms_avg/p95/max=%.2f/%.2f/%.2f card_loop_ms_avg/p95/max=%.2f/%.2f/%.2f paint_gap_ms_avg/p95/max=%.2f/%.2f/%.2f scroll_update_gap_ms_avg/p95/max=%.2f/%.2f/%.2f qscroll_gap_ms_avg/p95/max=%.2f/%.2f/%.2f damage_area_px_avg/p95/max=%.0f/%.0f/%.0f shift_ms_avg/p95/max=%.3f/%.3f/%.3f thumb_cache_hits=%d misses=%d card_cache_hits=%d misses=%d slow_paints=[%s]',diag['mode'],elapsed,diag['wheel_events'],diag['scroll_steps'],diag['qscroll_events'],len(diag['paint_ms']),diag['painted_cards'],paint_avg,paint_p95,paint_max,card_avg,card_p95,card_max,*paint_gap,*scroll_gap,*qscroll_gap,damage_avg,damage_p95,damage_max,shift_avg,shift_p95,shift_max,diag['cache_hits'],diag['cache_misses'],diag['card_cache_hits'],diag['card_cache_misses'],slow)
+        self._scroll_diagnostic=None
+
     def on_scroll(self,value):
+        self.begin_scroll_diagnostic()
+        diag=self._scroll_diagnostic
+        if diag is not None:
+            stamp=time.perf_counter();diag['scroll_steps']+=1
+            if diag['last_scroll'] is not None:diag['scroll_gaps_ms'].append((stamp-diag['last_scroll'])*1000)
+            diag['last_scroll']=stamp
         now=__import__('time').monotonic()
         dt=now-self.last_scroll_time if self.last_scroll_time else 1
         speed=abs(value-self.last_scroll_value)/max(dt,0.001)
-        smooth_active=self.wheel_scroller.state()!=QScroller.Inactive
+        smooth_active=self.smooth_scroll_animation.state()==QAbstractAnimation.Running
         # QScroller advances in small increments, so velocity alone can miss
         # fast-scroll mode. Avoid starting thumbnail work while its animation
         # is moving; that competes with painting and causes frame hitches.
@@ -941,9 +1007,10 @@ class VirtualGrid(QAbstractScrollArea):
                 self.folder_futures.pop(key,None)
 
     def scroll_settled(self):
-        if self.wheel_scroller.state()!=QScroller.Inactive:
+        if self.smooth_scroll_animation.state()==QAbstractAnimation.Running:
             self.scroll_settle_timer.start(100)
             return
+        self.finish_scroll_diagnostic()
         self.fast_scroll=False
         self.update_scroll_work()
         cursor=self.viewport().mapFromGlobal(QCursor.pos())
@@ -1022,9 +1089,11 @@ class VirtualGrid(QAbstractScrollArea):
         if self._closing:return None
         key=(str(path),int(box.width()),int(box.height()))
         if key in self.cache:
+            if self._scroll_diagnostic is not None:self._scroll_diagnostic['cache_hits']+=1
             self.cache.move_to_end(key)
             if self._visible_cache_keys is not None:self._visible_cache_keys.add(key)
             return self.cache[key]
+        if self._scroll_diagnostic is not None:self._scroll_diagnostic['cache_misses']+=1
         if self.fast_scroll:return self.cache.get(key)
         if key not in self.thumb_futures:
             self.thumb_futures[key]=self.pool.submit(self.thumbnail_worker,str(path),int(box.width()),int(box.height()))
@@ -1059,7 +1128,9 @@ class VirtualGrid(QAbstractScrollArea):
             # replaced when the worker completes.
             if source and thumb_pix is None and not self.fast_scroll and thumb_key not in self.thumb_futures:
                 self.pix(source,QSize(side,side))
+            if self._scroll_diagnostic is not None:self._scroll_diagnostic['card_cache_hits']+=1
         else:
+            if self._scroll_diagnostic is not None:self._scroll_diagnostic['card_cache_misses']+=1
             cached=self.render_card_pixmap(i,r.size(),side,source,meta,dpr)
             if cached is not None and cache_enabled:
                 self.card_cache[cache_key]=cached;self.card_cache_bytes+=self.pixmap_bytes(cached)
@@ -1287,7 +1358,7 @@ class VirtualGrid(QAbstractScrollArea):
             count=explorer.tabbar.count()
             if count:explorer.tabbar.setCurrentIndex((explorer.tabbar.currentIndex()+(-1 if e.modifiers()&Qt.ShiftModifier else 1))%count)
             return True
-        if Qt.Key_1<=key<=Qt.Key_6 and not e.modifiers()&(Qt.ControlModifier|Qt.AltModifier|Qt.ShiftModifier):explorer.set_sort(('name','mtime','ctime','type','size','random')[key-Qt.Key_1]);return True
+        if Qt.Key_1<=key<=Qt.Key_7 and not e.modifiers()&(Qt.ControlModifier|Qt.AltModifier|Qt.ShiftModifier):explorer.set_sort(('name','mtime','ctime','type','size','random','manual')[key-Qt.Key_1]);return True
         if key in (Qt.Key_Return,Qt.Key_Enter,Qt.Key_Space):
             if 0<=self.navigation_index<len(self.items):explorer.open(str(self.items[self.navigation_index]['path']))
             return True
@@ -1671,6 +1742,8 @@ class MediaCanvas(QWidget):
             fit=min(area.width()/max(1,oriented_w),area.height()/max(1,oriented_h))
             scale=max(.05,min(8.0,fit*self.viewer.zoom));w=source.width()*scale;h=source.height()*scale
             oriented_size=QSize(max(1,round(oriented_w*scale)),max(1,round(oriented_h*scale)))
+            if self.viewer.rotation%360==0 and not self.viewer.flip_h and not self.viewer.flip_v and abs(self.viewer.zoom-1.0)<1e-6 and oriented_size==source.size():
+                x=(self.width()-source.width())//2+self.pan_offset.x();y=(self.height()-source.height())//2+self.pan_offset.y();p.drawPixmap(x,y,source);return
             cache_key=(source.cacheKey(),self.size(),round(scale,6),self.viewer.rotation,self.viewer.flip_h,self.viewer.flip_v)
             # Resample once when the image or view transform changes, then use
             # an integer-position blit while dragging. This prevents repeated
@@ -1822,28 +1895,31 @@ class MediaViewer(QMainWindow):
             self.index=-1;self.full_image=QImage();self.static_pixmap=QPixmap();self.fit_pixmap=QPixmap();self.original_resolution=QSize();self.current_file_size=None;self.loading=False;self.canvas.prepare_frame();return
         self.index=max(0,min(self.index,len(self.paths)-1))
         self.full_image=QImage();self.static_pixmap=QPixmap();self.fit_pixmap=QPixmap();self.original_resolution=QSize();self.double_page_path=None;self.double_page_frame=QPixmap();self.loading=False;self.rotation=0;self.flip_h=False;self.flip_v=False;self.zoom=1.0;self.canvas.pan_offset=QPoint();path=self.paths[self.index]
-        try:self.current_file_size=Path(path).stat().st_size
-        except OSError:self.current_file_size=None
+        self.current_file_size=None
         if Path(path).suffix.casefold() in ('.gif','.webp'):
             movie=QMovie(str(path));movie.setCacheMode(QMovie.CacheNone)
             if movie.isValid():
                 self.movie=movie;movie.frameChanged.connect(self.canvas.prepare_frame);movie.start()
                 if not self.original_resolution.isValid() and not movie.currentPixmap().isNull():self.original_resolution=movie.currentPixmap().size()
+                self.request_file_size(path)
             else:
                 entry=self.image_cache.get(path)
-                if entry is not None:self.image_cache.move_to_end(path);self.full_image,self.fit_pixmap=entry[:2];self.static_pixmap=QPixmap();self.original_resolution=entry[2] if len(entry)>2 and entry[2].isValid() else self.full_image.size()
+                if entry is not None:self.image_cache.move_to_end(path);self.full_image,self.fit_pixmap=entry[:2];self.static_pixmap=QPixmap();self.original_resolution=entry[2] if len(entry)>2 and entry[2].isValid() else self.full_image.size();self.current_file_size=entry[3] if len(entry)>3 else None
                 else:self.loading=True;self.request_image(path)
         else:
             entry=self.image_cache.get(path)
-            if entry is not None:self.image_cache.move_to_end(path);self.full_image,self.fit_pixmap=entry[:2];self.static_pixmap=QPixmap();self.original_resolution=entry[2] if len(entry)>2 and entry[2].isValid() else self.full_image.size()
+            if entry is not None:self.image_cache.move_to_end(path);self.full_image,self.fit_pixmap=entry[:2];self.static_pixmap=QPixmap();self.original_resolution=entry[2] if len(entry)>2 and entry[2].isValid() else self.full_image.size();self.current_file_size=entry[3] if len(entry)>3 else None
             else:self.loading=True;self.request_image(path)
         self.setWindowTitle('Magellan Viewer');self.canvas.prepare_frame();self.preload_neighbours()
-    def request_image(self,path,preload=False):
-        if path in self.pending_image_paths:return
-        self.pending_image_paths.add(path);preview_size=QSize(self.canvas.size());
-        if preview_size.width()<2 or preview_size.height()<2:
-            screen=QApplication.primaryScreen();preview_size=screen.size() if screen else QSize(1920,1080)
-        future=VIEWER_IMAGE_POOL.submit(decode_viewer_image,path,preview_size,self.cache_max_dimension,self.cache_max_file_bytes,preload);self.image_load_futures[path]=future
+    def viewer_preview_size(self):
+        size=QSize(self.canvas.size())
+        if size.width()<2 or size.height()<2:
+            screen=QApplication.primaryScreen();size=screen.size() if screen else QSize(1920,1080)
+        return size
+    def submit_full_image_decode(self,path,preload=False):
+        preview_size=self.viewer_preview_size()
+        future=VIEWER_IMAGE_POOL.submit(decode_viewer_image,path,preview_size,self.cache_max_dimension,self.cache_max_file_bytes,preload)
+        self.image_load_futures[path]=future
         def completed(result,p=path):
             try:data=result.result()
             except Exception:
@@ -1851,23 +1927,44 @@ class MediaViewer(QMainWindow):
                 data=(QImage(),QImage(),False,QSize())
             self.load_bridge.loaded.emit(p,data)
         future.add_done_callback(completed)
+    def request_image(self,path,preload=False):
+        if path in self.pending_image_paths:return
+        self.pending_image_paths.add(path);self.submit_full_image_decode(path,preload=preload)
+    def request_file_size(self,path):
+        if path in self.pending_image_paths:return
+        self.pending_image_paths.add(path)
+        future=VIEWER_IMAGE_POOL.submit(lambda p=path:Path(p).stat().st_size);self.image_load_futures[path]=future
+        def completed(result,p=path):
+            try:data={'stage':'metadata','size':result.result()}
+            except OSError:data={'stage':'metadata','size':None}
+            except Exception:
+                logger.debug('Could not read image size for %s',p,exc_info=True);data={'stage':'metadata','size':None}
+            self.load_bridge.loaded.emit(p,data)
+        future.add_done_callback(completed)
     def preload_neighbours(self):
-        if not self.paths:return
-        # Prioritize the next image for the common forward-swipe direction.
+        if not self.paths or not 0<=self.index<len(self.paths):return
+        current=self.paths[self.index]
+        # Preserve the proven 1.3 behavior: prepare both adjacent images so a
+        # swipe in either direction normally uses the in-memory cache.
         for offset in (1,-1):
             path=self.paths[(self.index+offset)%len(self.paths)]
-            if path not in self.image_cache and path not in self.pending_image_paths and path!=self.paths[self.index]:self.request_image(path,preload=True)
+            if path!=current and path not in self.image_cache and path not in self.pending_image_paths:self.request_image(path,preload=True)
     def on_image_loaded(self,path,image):
-        self.pending_image_paths.discard(path);self.image_load_futures.pop(path,None)
         if not self.paths:return
+        self.pending_image_paths.discard(path);self.image_load_futures.pop(path,None)
+        if isinstance(image,dict) and image.get('stage')=='metadata':
+            if path==self.paths[self.index]:self.current_file_size=image.get('size');self.canvas.update()
+            return
         cacheable=True;source_size=QSize()
+        file_size=None
         if isinstance(image,tuple):
             full_image,fit_image=image[:2]
             if len(image)>2:cacheable=bool(image[2])
             if len(image)>3 and isinstance(image[3],QSize):source_size=image[3]
+            if len(image)>4 and isinstance(image[4],int):file_size=image[4]
         else:full_image=fit_image=image
         if not full_image.isNull():
-            fit_pixmap=QPixmap.fromImage(fit_image);source_size=source_size if source_size.isValid() else full_image.size();entry=(full_image,fit_pixmap,source_size)
+            fit_pixmap=QPixmap.fromImage(fit_image);source_size=source_size if source_size.isValid() else full_image.size();entry=(full_image,fit_pixmap,source_size,file_size)
             entry_bytes=self.cache_entry_bytes(entry)
             if cacheable and entry_bytes<=self.image_cache_limit and self.cache_window_contains(path):
                 previous=self.image_cache.pop(path,None)
@@ -1875,8 +1972,11 @@ class MediaViewer(QMainWindow):
                 self.image_cache[path]=entry;self.image_cache_bytes+=entry_bytes
             while self.image_cache_bytes>self.image_cache_limit and len(self.image_cache)>1:
                 old_path,old_entry=self.image_cache.popitem(last=False);self.image_cache_bytes-=self.cache_entry_bytes(old_entry)
-            if path==self.paths[self.index]:self.full_image,self.fit_pixmap=entry[:2];self.static_pixmap=QPixmap();self.original_resolution=source_size;self.loading=False;self.canvas.prepare_frame()
+            if path==self.paths[self.index]:
+                self.full_image,self.fit_pixmap=entry[:2];self.static_pixmap=QPixmap();self.original_resolution=source_size;self.current_file_size=file_size;self.loading=False;self.canvas.prepare_frame();self.preload_neighbours()
             elif self.double_page and self.paths and path==self.paths[(self.index+1)%len(self.paths)]:self.double_page_path=path;self.double_page_frame=fit_pixmap;self.canvas.update()
+        elif path==self.paths[self.index]:
+            self.loading=False;self.canvas.prepare_frame();self.preload_neighbours()
     def showEvent(self,e):super().showEvent(e);self.load_current()
     def step(self,amount):
         if not self.paths:return
@@ -1965,15 +2065,20 @@ class MediaViewer(QMainWindow):
         self.image_load_futures.clear();self.pending_image_paths.clear();self.image_cache.clear();self.image_cache_bytes=0
         self.paths.clear();self.index=-1;self.pending_delete_path=None
         parent=self.parent()
-        if parent is not None and hasattr(parent,'viewer_closed'):parent.viewer_closed()
+        if parent is not None and hasattr(parent,'viewer_closed'):
+            try:parent.viewer_closed(self)
+            except RuntimeError:logger.debug('Viewer closed after its parent was deleted')
         super().closeEvent(e)
 
 
 class Explorer(QMainWindow):
     def __init__(self):
-        super().__init__();self._closing=False;self.setWindowTitle('Magellan');icon_root=Path(sys._MEIPASS) if getattr(sys,'frozen',False) else Path(__file__).resolve().parent.parent;self.icon_root=icon_root;self.icon_dir=icon_root/'Alternative Icons';icon_path=icon_root/'MainIcon.ico';self.app_icon=QIcon(str(icon_path)) if icon_path.is_file() else make_boat_icon();self.setWindowIcon(self.app_icon);QApplication.setWindowIcon(self.app_icon);self.resize(1900,1000);self.window_cycle=0;self.in_favorites_view=False;self.setStyleSheet(QSS)
-        self.hover_details_enabled=True;self.hover_details_delay=500;self.hover_details_placement='top';self.slideshow_interval_ms=5000;self.wheel_scroll_rows=1;self.smooth_wheel_scroll=False;self._tab_drag_active=False;self.auto_hide_main=False;self.auto_hide_tabs=False;self.auto_hide_tree=False;self.main_hide_delay=900;self.tree_hide_delay=900;self.right_controls_auto_hide=True;self.right_controls_hide_delay=500;self.favorite_organize_mode=False;self.favorites_navigation_root=None;self.favorite_return_group=None;self.recursive_search_enabled=False;self.recursive_search_results=None;self.recursive_search_result_query='';self.recursive_search_generation=0;self.recursive_search_jobs=[];self.google_lens_query='';self.disk_thumbnail_cache_limit_enabled=False;self.disk_thumbnail_cache_limit_mib=4096;self._disk_cache_trim_lock=threading.Lock();self._disk_cache_trim_future=None
+        super().__init__();self._closing=False;self.viewer=None;self.setWindowTitle('Magellan');icon_root=Path(sys._MEIPASS) if getattr(sys,'frozen',False) else Path(__file__).resolve().parent.parent;self.icon_root=icon_root;self.icon_dir=icon_root/'Alternative Icons';icon_path=icon_root/'MainIcon.ico';self.app_icon=QIcon(str(icon_path)) if icon_path.is_file() else make_boat_icon();self.setWindowIcon(self.app_icon);QApplication.setWindowIcon(self.app_icon);self.resize(1900,1000);self.window_cycle=0;self.in_favorites_view=False;self.setStyleSheet(QSS)
+        self.hover_details_enabled=True;self.hover_details_delay=500;self.hover_details_placement='top';self.slideshow_interval_ms=5000;self.wheel_scroll_rows=1;self.smooth_wheel_scroll=False;self.scroll_test_logging_enabled=False;self.auto_refresh_folders=False;self.folder_refresh_interval_s=30;self._tab_drag_active=False;self.auto_hide_main=False;self.auto_hide_tabs=False;self.auto_hide_tree=False;self.main_hide_delay=900;self.tree_hide_delay=900;self.right_controls_auto_hide=True;self.right_controls_hide_delay=500;self.favorite_organize_mode=False;self.favorites_navigation_root=None;self.favorite_return_group=None;self.recursive_search_enabled=False;self.recursive_search_results=None;self.recursive_search_result_query='';self.recursive_search_generation=0;self.recursive_search_jobs=[];self.google_lens_query='';self.disk_thumbnail_cache_limit_enabled=False;self.disk_thumbnail_cache_limit_mib=4096;self._disk_cache_trim_lock=threading.Lock();self._disk_cache_trim_future=None
         self.current=Path.home();self.items=[];self.sort='name';self.desc=False;self.columns=5;self.thumb=260;self.mode='vertical';self.thumbnail_cache_enabled=True;self.thumbnail_cache_limit_mib=256;self.favorites=set();self.favorite_groups=[];self.active_favorite_group=None;self.tree_favorites=set();self.tree_expanded_paths=set();self.tree_selected_path='';self.tree_scroll_value=0;self.tree_scroll_anchor_path='';self.tree_scroll_anchor_offset=0;self._tree_scroll_restore_pending=False;self.pinned_folders=set();self._pinned_folders_generation=0;self.pinned_thumbs={};self.pinned_folder_sizes={};self.pinned_folder_sizes_checked={};self.custom={};self.startup_folder=None;self.tabs=[];self.active_tab_index=-1;self.saved_tabs=[];self.saved_active_tab=0;self.scan_generation=0;self.scan_jobs=[];self.return_to_favorites=False;self.favorites_return_path=None;self.scroll_positions={};self.folder_sort_settings={};self.folder_manual_orders={};self.manual_order_created={};self._suppress_scroll_save=False;self.window_mode='fullscreen';self.last_deletion_undo=None;self.cache_dir=Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation));self.cache_dir.mkdir(parents=True,exist_ok=True);self.settings_file=self.cache_dir/'settings.json';self.install_dir=Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else Path(__file__).resolve().parent;self.persistent_thumb_dir=self.install_dir/'thumbnail_cache';self.persistent_thumb_dir.mkdir(parents=True,exist_ok=True);self.load_settings();self.persistent_thumb_dir=Path(getattr(self,'thumbnail_cache_dir',self.persistent_thumb_dir));self.persistent_thumb_dir.mkdir(parents=True,exist_ok=True);self.back_target=Path(self.startup_folder) if self.startup_folder else Path(self.current);self.image_search_provider='saucenao';self.image_search_mode=False;self.scan=None;self.work=None;self.build();self.grid.set_cache_limit_mib(self.thumbnail_cache_limit_mib);self.grid.persistent_folder_cache_dir=self.persistent_thumb_dir;self.grid.folder_cache.update(self.pinned_thumbs);self.grid.folder_size_cache.update(self.pinned_folder_sizes);self.grid.folder_size_cache_checked_at.update(self.pinned_folder_sizes_checked)
+        self._folder_refresh_scan=None;self._folder_refresh_context=None;self._folder_refresh_pending=None;self._folder_refresh_generation=0
+        self.folder_refresh_timer=QTimer(self);self.folder_refresh_timer.timeout.connect(self.auto_refresh_folder_page);self.sync_folder_refresh_timer()
+        self.folder_refresh_apply_timer=QTimer(self);self.folder_refresh_apply_timer.setSingleShot(True);self.folder_refresh_apply_timer.setInterval(400);self.folder_refresh_apply_timer.timeout.connect(self.apply_pending_folder_refresh)
         self._folder_thumb_bridge=FolderThumbnailBridge(self);self._folder_thumb_bridge.completed.connect(self.handle_pinned_thumbnail_ready)
         self.restore_tabs()
         if self.disk_thumbnail_cache_limit_enabled:self.schedule_disk_thumbnail_cache_trim()
@@ -1999,6 +2104,9 @@ class Explorer(QMainWindow):
             self.slideshow_interval_ms=max(250,min(60000,int(d.get('slideshow_interval_ms',5000))))
             self.wheel_scroll_rows=max(.1,min(12.0,float(d.get('wheel_scroll_rows',1))))
             self.smooth_wheel_scroll=bool(d.get('smooth_wheel_scroll',False))
+            self.scroll_test_logging_enabled=bool(d.get('scroll_test_logging_enabled',False))
+            self.auto_refresh_folders=bool(d.get('auto_refresh_folders',False))
+            self.folder_refresh_interval_s=max(1,min(3600,int(d.get('folder_refresh_interval_s',30))))
             self.log_storage_mib=max(1,min(64,int(d.get('log_storage_mib',8))))
             self.recursive_search_enabled=bool(d.get('recursive_search_enabled',False))
             self.google_lens_query=d.get('google_lens_query','') if isinstance(d.get('google_lens_query',''),str) else ''
@@ -2111,10 +2219,10 @@ class Explorer(QMainWindow):
         data['thumbnail_cache_dir']=cache_path if isinstance(cache_path,str) and cache_path.strip() else ''
         for key in ('startup','last','geometry','saucenao_api_key','google_lens_query'):
             if data.get(key) is not None and not isinstance(data.get(key),str):data[key]=None if key not in ('saucenao_api_key','google_lens_query') else ''
-        for key,default in {'active_tab':0,'hover_details_delay':500,'thumbnail_cache_limit_mib':256,'disk_thumbnail_cache_limit_mib':4096,'main_hide_delay':900,'tree_hide_delay':900,'slideshow_interval_ms':5000,'log_storage_mib':8,'right_controls_hide_delay':500}.items():
+        for key,default in {'active_tab':0,'hover_details_delay':500,'thumbnail_cache_limit_mib':256,'disk_thumbnail_cache_limit_mib':4096,'main_hide_delay':900,'tree_hide_delay':900,'slideshow_interval_ms':5000,'log_storage_mib':8,'right_controls_hide_delay':500,'folder_refresh_interval_s':30}.items():
             try:data[key]=int(data.get(key,default))
             except (TypeError,ValueError,OverflowError):data[key]=default
-        for key,default in {'hover_details_enabled':True,'thumbnail_cache_enabled':True,'disk_thumbnail_cache_limit_enabled':False,'auto_hide_main':False,'auto_hide_tabs':False,'auto_hide_tree':False,'right_controls_auto_hide':True,'recursive_search_enabled':False,'smooth_wheel_scroll':False}.items():
+        for key,default in {'hover_details_enabled':True,'thumbnail_cache_enabled':True,'disk_thumbnail_cache_limit_enabled':False,'auto_hide_main':False,'auto_hide_tabs':False,'auto_hide_tree':False,'right_controls_auto_hide':True,'recursive_search_enabled':False,'smooth_wheel_scroll':False,'scroll_test_logging_enabled':False,'auto_refresh_folders':False}.items():
             data[key]=data.get(key,default) if isinstance(data.get(key,default),bool) else default
         try:data['wheel_scroll_rows']=max(.1,min(12.0,float(data.get('wheel_scroll_rows',1))))
         except (TypeError,ValueError,OverflowError):data['wheel_scroll_rows']=1.0
@@ -2128,7 +2236,7 @@ class Explorer(QMainWindow):
             logger.debug('Could not save window geometry',exc_info=True)
         tabs=[{k:v for k,v in tab.items() if k in ('path','kind','scroll','positions','sort','desc','unsorted','selection','color','source_order','view_id')} for tab in getattr(self,'tabs',[])]
         payload=json.dumps({'favorites':list(self.favorites),'favorite_groups':self.favorite_groups,'tree_favorites':list(self.tree_favorites),'pinned_folders':list(self.pinned_folders),'pinned_thumbs':self.pinned_thumbs,'pinned_folder_sizes':self.pinned_folder_sizes,'pinned_folder_sizes_checked':self.pinned_folder_sizes_checked,'custom':self.custom,'image_search_provider':self.image_search_provider,'saucenao_api_key':getattr(self,'saucenao_api_key',''),'hover_details_enabled':self.hover_details_enabled,'hover_details_delay':self.hover_details_delay,'hover_details_placement':self.hover_details_placement,'thumbnail_cache_enabled':self.thumbnail_cache_enabled,'thumbnail_cache_limit_mib':self.thumbnail_cache_limit_mib,'auto_hide_main':getattr(self,'auto_hide_main',False),'auto_hide_tabs':getattr(self,'auto_hide_tabs',False),'auto_hide_tree':getattr(self,'auto_hide_tree',False),'main_hide_delay':getattr(self,'main_hide_delay',900),'tree_hide_delay':getattr(self,'tree_hide_delay',900),'last':str(self.current),'startup':self.startup_folder,'window_mode':self.window_mode,'geometry':geometry,'tabs':tabs,'active_tab':max(0,self.current_tab_index()) if hasattr(self,'tabbar') else 0})
-        payload=json.dumps(json.loads(payload)|{'slideshow_interval_ms':self.slideshow_interval_ms,'wheel_scroll_rows':self.wheel_scroll_rows,'smooth_wheel_scroll':self.smooth_wheel_scroll,'right_controls_auto_hide':self.right_controls_auto_hide,'right_controls_hide_delay':self.right_controls_hide_delay,'log_storage_mib':self.log_storage_mib,'recursive_search_enabled':self.recursive_search_enabled,'folder_sort_settings':self.folder_sort_settings,'folder_manual_orders':self.folder_manual_orders,'manual_order_created':self.manual_order_created,'tree_expanded_paths':sorted(self.tree_expanded_paths),'tree_selected_path':self.tree_selected_path,'tree_scroll_value':self.tree_scroll_value,'tree_scroll_anchor_path':getattr(self,'tree_scroll_anchor_path',''),'tree_scroll_anchor_offset':getattr(self,'tree_scroll_anchor_offset',0),'thumbnail_cache_dir':str(self.persistent_thumb_dir),'google_lens_query':getattr(self,'google_lens_query',''),'disk_thumbnail_cache_limit_enabled':self.disk_thumbnail_cache_limit_enabled,'disk_thumbnail_cache_limit_mib':self.disk_thumbnail_cache_limit_mib})
+        payload=json.dumps(json.loads(payload)|{'slideshow_interval_ms':self.slideshow_interval_ms,'wheel_scroll_rows':self.wheel_scroll_rows,'smooth_wheel_scroll':self.smooth_wheel_scroll,'scroll_test_logging_enabled':self.scroll_test_logging_enabled,'auto_refresh_folders':self.auto_refresh_folders,'folder_refresh_interval_s':self.folder_refresh_interval_s,'right_controls_auto_hide':self.right_controls_auto_hide,'right_controls_hide_delay':self.right_controls_hide_delay,'log_storage_mib':self.log_storage_mib,'recursive_search_enabled':self.recursive_search_enabled,'folder_sort_settings':self.folder_sort_settings,'folder_manual_orders':self.folder_manual_orders,'manual_order_created':self.manual_order_created,'tree_expanded_paths':sorted(self.tree_expanded_paths),'tree_selected_path':self.tree_selected_path,'tree_scroll_value':self.tree_scroll_value,'tree_scroll_anchor_path':getattr(self,'tree_scroll_anchor_path',''),'tree_scroll_anchor_offset':getattr(self,'tree_scroll_anchor_offset',0),'thumbnail_cache_dir':str(self.persistent_thumb_dir),'google_lens_query':getattr(self,'google_lens_query',''),'disk_thumbnail_cache_limit_enabled':self.disk_thumbnail_cache_limit_enabled,'disk_thumbnail_cache_limit_mib':self.disk_thumbnail_cache_limit_mib})
         try:
             self.settings_file.parent.mkdir(parents=True,exist_ok=True)
             tmp=self.settings_file.with_suffix('.tmp')
@@ -2158,6 +2266,118 @@ class Explorer(QMainWindow):
             self.wheel_scroll_rows=rows.value();self.smooth_wheel_scroll=smooth.isChecked()
             if not self.smooth_wheel_scroll:self.grid.stop_smooth_scroll()
             self.save_settings()
+    def configure_folder_auto_refresh(self):
+        dlg=QDialog(self);dlg.setWindowTitle('Automatic folder refresh');layout=QVBoxLayout(dlg)
+        enabled=QCheckBox('Automatically refresh the active folder page');enabled.setChecked(self.auto_refresh_folders);layout.addWidget(enabled)
+        row=QHBoxLayout();row.addWidget(QLabel('Refresh every'));interval=QSpinBox();interval.setRange(1,3600);interval.setSingleStep(5);interval.setSuffix(' seconds');interval.setValue(self.folder_refresh_interval_s);row.addWidget(interval);row.addStretch(1);layout.addLayout(row)
+        enabled.toggled.connect(interval.setEnabled);interval.setEnabled(enabled.isChecked())
+        note=QLabel('Magellan checks the open folder in a low-priority background scan and applies changes after scrolling or selection is idle. It never navigates away or resets the current scroll position. Checks are skipped while another folder scan is running, or while Favorites, Farview, or the image viewer is active.');note.setWordWrap(True);layout.addWidget(note)
+        buttons=QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel);buttons.accepted.connect(dlg.accept);buttons.rejected.connect(dlg.reject);layout.addWidget(buttons)
+        if dlg.exec()==QDialog.Accepted:
+            self.auto_refresh_folders=enabled.isChecked();self.folder_refresh_interval_s=interval.value();self.sync_folder_refresh_timer();self.save_settings()
+    def sync_folder_refresh_timer(self):
+        timer=getattr(self,'folder_refresh_timer',None)
+        if timer is None:return
+        if self.auto_refresh_folders and not self._closing:timer.start(self.folder_refresh_interval_s*1000)
+        else:
+            timer.stop()
+            apply_timer=getattr(self,'folder_refresh_apply_timer',None)
+            if apply_timer is not None:apply_timer.stop()
+            self._folder_refresh_pending=None
+            self._folder_refresh_context=None
+            job=getattr(self,'_folder_refresh_scan',None)
+            if job is not None and job.isRunning():job.requestInterruption()
+    def auto_refresh_folder_page(self):
+        if self._closing or not self.auto_refresh_folders or self.in_favorites_view or self.viewer is not None:return
+        if self._folder_refresh_context is not None:return
+        if self._folder_refresh_scan is not None and self._folder_refresh_scan.isRunning():return
+        if self._folder_refresh_pending is not None:return
+        index=self.current_tab_index()
+        if not (0<=index<len(self.tabs)) or self.tabs[index].get('kind')!='folder':return
+        grid=self.grid
+        if grid.selection_dragging or grid.fast_scroll or grid.smooth_scroll_animation.state()==QAbstractAnimation.Running or grid.scroll_settle_timer.isActive():return
+        scan=self.scan
+        if scan is not None and scan.isRunning():return
+        if self.recursive_search_enabled and self.search.text().strip():return
+        try:
+            folder=Path(self.current)
+            if not folder.is_dir():return
+            self._folder_refresh_generation+=1;generation=self._folder_refresh_generation
+            self._folder_refresh_context={'folder':str(folder),'tab':self.tabs[index],'scan_generation':self.scan_generation,'generation':generation}
+            task=ScanTask(folder,recursive=False,generation=generation,manual_orders=self.folder_manual_orders,manual_sort_settings=self.folder_sort_settings)
+            task.signals.done.connect(self.folder_refresh_scanned)
+            task.finished.connect(lambda job=task:self.release_folder_refresh_job(job))
+            task.finished.connect(lambda job=task:self.release_scan_job(job))
+            self._folder_refresh_scan=task
+            self.scan_jobs.append(task)
+            task.start(QThread.LowPriority)
+        except Exception:logger.exception('Automatic folder refresh failed for %s',self.current)
+    def release_folder_refresh_job(self,job):
+        if self._folder_refresh_scan is job:self._folder_refresh_scan=None
+    def folder_refresh_scanned(self,items,error,generation):
+        context=self._folder_refresh_context
+        if not context or generation!=context.get('generation'):return
+        self._folder_refresh_context=None
+        if not self.auto_refresh_folders or self._closing:return
+        if error:
+            logger.warning('Automatic folder refresh could not read %s: %s',context['folder'],error)
+            return
+        self._folder_refresh_pending=(items,context)
+        self.apply_pending_folder_refresh()
+    def apply_pending_folder_refresh(self):
+        pending=self._folder_refresh_pending
+        if pending is None:return
+        if self._closing or not self.auto_refresh_folders:
+            self._folder_refresh_pending=None
+            return
+        items,context=pending
+        index=self.current_tab_index()
+        if (not 0<=index<len(self.tabs) or self.tabs[index] is not context['tab'] or
+                str(self.current)!=context['folder'] or self.scan_generation!=context['scan_generation'] or
+                self.in_favorites_view or self.viewer is not None):
+            self._folder_refresh_pending=None
+            return
+        grid=self.grid
+        if grid.selection_dragging or grid.fast_scroll or grid.smooth_scroll_animation.state()==QAbstractAnimation.Running or grid.scroll_settle_timer.isActive():
+            self.folder_refresh_apply_timer.start()
+            return
+        if self.scan is not None and self.scan.isRunning():
+            self.folder_refresh_apply_timer.start()
+            return
+        previous={str(item.get('path')):(bool(item.get('is_dir')),item.get('mtime'),item.get('ctime'),item.get('size')) for item in self.items}
+        updated={str(item.get('path')):(bool(item.get('is_dir')),item.get('mtime'),item.get('ctime'),item.get('size')) for item in items}
+        if previous==updated:
+            self._folder_refresh_pending=None
+            return
+        scroll=grid.verticalScrollBar().value()
+        selected=set(grid.selected_paths)
+        navigation_path=(str(grid.items[grid.navigation_index].get('path'))
+                         if 0<=grid.navigation_index<len(grid.items) else None)
+        hover_path=(str(grid.items[grid.hover_index].get('path'))
+                    if 0<=grid.hover_index<len(grid.items) else None)
+        hover_delay_remaining=grid.hover_delay_timer.remainingTime() if grid.hover_delay_timer.isActive() else None
+        hover_animation_active=grid.hover_animation_timer.isActive()
+        hover_animation_started=grid.hover_animation_started
+        self._folder_refresh_pending=None
+        self.items=items
+        self.refresh()
+        new_indices={str(item.get('path')):index for index,item in enumerate(grid.items)}
+        valid_paths={str(item.get('path')) for item in items if item.get('path') is not None}
+        grid.selected_paths.intersection_update(valid_paths)
+        grid.selected_metadata={path:value for path,value in grid.selected_metadata.items() if path in grid.selected_paths}
+        if selected!=grid.selected_paths:self.update_selection_button()
+        grid.navigation_index=new_indices.get(navigation_path,-1) if navigation_path else -1
+        grid.hover_index=new_indices.get(hover_path,-1) if hover_path else -1
+        if hover_delay_remaining is not None and grid.hover_index>=0:grid.hover_delay_timer.start(max(0,hover_delay_remaining))
+        if hover_animation_active and grid.hover_index>=0:
+            grid.hover_animation_started=hover_animation_started;grid.hover_animation_timer.start()
+        grid.verticalScrollBar().setValue(min(scroll,grid.verticalScrollBar().maximum()))
+        grid.viewport().update()
+    def set_scroll_test_logging_enabled(self,enabled):
+        self.scroll_test_logging_enabled=bool(enabled)
+        if not self.scroll_test_logging_enabled:self.grid._scroll_diagnostic=None
+        self.save_settings()
+        if hasattr(self,'status'):self.status.setText('Scroll test logging '+('enabled' if enabled else 'disabled'))
     def configure_right_controls(self):
         dlg=QDialog(self);dlg.setWindowTitle('Right-side buttons');layout=QVBoxLayout(dlg)
         hide=QCheckBox('Hide right-side buttons until the pointer reaches the right edge');hide.setChecked(self.right_controls_auto_hide);layout.addWidget(hide)
@@ -2216,13 +2436,13 @@ class Explorer(QMainWindow):
         self.root_widget.update()
     def check_titlebar_hover(self):
         if not self.auto_hide_main or not hasattr(self,'main_bar') or isinstance(QApplication.activeWindow(),MediaViewer):return
+        if self.search_has_focus():
+            self.main_hide_timer.stop()
+            if not self.main_bar.isVisible():self.set_main_panel_visible(True)
+            return
         if getattr(self,'shift_selection_held',False):
             self.main_hide_timer.stop()
             if self.main_bar.isVisible():self.set_main_panel_visible(False)
-            return
-        if QApplication.focusWidget() is getattr(self,'search',None):
-            self.main_hide_timer.stop()
-            if not self.main_bar.isVisible():self.set_main_panel_visible(True)
             return
         cursor=QCursor.pos();frame=self.frameGeometry();client=self.geometry()
         in_titlebar=frame.contains(cursor) and cursor.y()<client.top() and not client.contains(cursor)
@@ -2246,7 +2466,7 @@ class Explorer(QMainWindow):
     def hide_main_panel(self):
         if getattr(self,'tab_context_menu_open',False) or getattr(self,'_tab_drag_active',False):return
         if getattr(self,'tab_reveal_timer',None) and self.tab_reveal_timer.isActive():return
-        if QApplication.focusWidget() is getattr(self,'search',None):return
+        if self.search_has_focus():return
         if hasattr(self,'menu_bar'):
             for action in self.menu_bar.actions():
                 menu=action.menu()
@@ -2254,6 +2474,9 @@ class Explorer(QMainWindow):
         if self.auto_hide_main and hasattr(self,'main_bar'):self.set_main_panel_visible(False)
     def set_main_panel_visible(self,visible):
         if not hasattr(self,'main_bar'):return
+        if not visible and self.auto_hide_main and self.search_has_focus():
+            self.main_hide_timer.stop()
+            return
         if self.auto_hide_main:
             self.main_bar_overlay_height=max(getattr(self,'main_bar_overlay_height',0),self.main_bar.sizeHint().height())
             self.main_bar.setGeometry(0,0,self.root_widget.width(),self.main_bar_overlay_height)
@@ -2279,6 +2502,8 @@ class Explorer(QMainWindow):
     def eventFilter(self,obj,event):
         viewer_active=isinstance(QApplication.activeWindow(),MediaViewer)
         active=QApplication.activeWindow();main_active=active is self or (active is not None and self.isAncestorOf(active));target_main=obj is self or (isinstance(obj,QWidget) and self.isAncestorOf(obj))
+        if event.type()==QEvent.MouseButtonPress and event.button()==Qt.LeftButton and isinstance(obj,QWidget) and hasattr(self,'main_bar') and self.main_bar.isAncestorOf(obj) and obj is not getattr(self,'search',None):
+            self.grid.setFocus(Qt.MouseFocusReason)
         if hasattr(self,'file_tree') and obj in (self.file_tree,self.file_tree.viewport()) and event.type() in (QEvent.Wheel,QEvent.MouseButtonPress,QEvent.KeyPress):
             if self._tree_scroll_restore_pending and not self._tree_restoring_scroll:
                 # Once the user interacts with the visible tree, its saved view
@@ -2315,18 +2540,19 @@ class Explorer(QMainWindow):
                 if count:self.tabbar.setCurrentIndex((self.tabbar.currentIndex()+(-1 if event.modifiers()&Qt.ShiftModifier else 1))%count)
                 event.accept();return True
             if (not editing or focus is self.search) and event.key()==Qt.Key_Q and not event.modifiers()&(Qt.ControlModifier|Qt.AltModifier):self.toggle_search_navigation_focus();event.accept();return True
-            if not editing and Qt.Key_1<=event.key()<=Qt.Key_6 and not event.modifiers()&(Qt.ControlModifier|Qt.AltModifier|Qt.ShiftModifier):self.set_sort(('name','mtime','ctime','type','size','random')[event.key()-Qt.Key_1]);event.accept();return True
+            if not editing and Qt.Key_1<=event.key()<=Qt.Key_7 and not event.modifiers()&(Qt.ControlModifier|Qt.AltModifier|Qt.ShiftModifier):self.set_sort(('name','mtime','ctime','type','size','random','manual')[event.key()-Qt.Key_1]);event.accept();return True
         if event.type()==QEvent.KeyPress and event.key()==Qt.Key_Shift:
             self.shift_selection_held=True
-            if self.auto_hide_main:self.main_hide_timer.stop();self.tab_reveal_timer.stop();self.set_main_panel_visible(False)
+            if self.auto_hide_main and not self.search_has_focus():self.main_hide_timer.stop();self.tab_reveal_timer.stop();self.set_main_panel_visible(False)
+            elif self.auto_hide_main:self.main_hide_timer.stop();self.tab_reveal_timer.stop();self.set_main_panel_visible(True)
             if self.auto_hide_tree:self.tree_hide_timer.stop();self.hide_tree_overlay()
             if hasattr(self,'favorite_group_overlay'):self.hide_favorite_controls()
         elif event.type()==QEvent.KeyRelease and event.key()==Qt.Key_Shift:self.shift_selection_held=False
         if viewer_active:
-            if self.auto_hide_main:self.set_main_panel_visible(False)
-            if self.auto_hide_tree and hasattr(self,'tree_dock'):
+            if self.auto_hide_main and (self.main_bar.isVisible() or (self.auto_hide_tabs and self.nav_bar.isVisible())):self.set_main_panel_visible(False)
+            if self.auto_hide_tree and hasattr(self,'tree_dock') and self.tree_dock.isVisible():
                 self.save_tree_navigation_state();self.tree_dock.hide()
-            if hasattr(self,'favorite_group_overlay'):self.hide_favorite_controls()
+            if hasattr(self,'favorite_group_overlay') and any(widget.isVisible() for widget in self.right_control_widgets()):self.hide_favorite_controls()
         if event.type()==QEvent.Resize and obj is getattr(self,'root_widget',None):
             if self.auto_hide_main:self.main_bar.setGeometry(0,0,self.root_widget.width(),self.main_bar.sizeHint().height())
             if self.auto_hide_main and self.auto_hide_tabs:self.nav_bar.setGeometry(0,self.main_bar.sizeHint().height(),self.root_widget.width(),self.nav_bar.sizeHint().height())
@@ -2350,7 +2576,7 @@ class Explorer(QMainWindow):
             pos=self.root_widget.mapFromGlobal(QCursor.pos())
             if self.auto_hide_main:
                 over_tabs=self.nav_bar.isVisible() and self.nav_bar.geometry().contains(pos)
-                if QApplication.focusWidget() is getattr(self,'search',None):
+                if self.search_has_focus():
                     self.main_hide_timer.stop()
                     if not self.main_bar.isVisible():self.set_main_panel_visible(True)
                 elif pos.y()<=2:
@@ -2401,6 +2627,12 @@ class Explorer(QMainWindow):
         self.update_window_button();self.save_settings()
     def closeEvent(self,e):
         self._closing=True
+        for timer_name in ('folder_refresh_timer','folder_refresh_apply_timer'):
+            timer=getattr(self,timer_name,None)
+            if timer is not None:timer.stop()
+        refresh_job=getattr(self,'_folder_refresh_scan',None)
+        if refresh_job is not None and refresh_job.isRunning():refresh_job.requestInterruption()
+        self._folder_refresh_pending=None;self._folder_refresh_context=None
         if hasattr(self,'recursive_search_timer'):self.recursive_search_timer.stop()
         for job in list(getattr(self,'recursive_search_jobs',[])):
             if job.isRunning():job.requestInterruption()
@@ -2413,7 +2645,12 @@ class Explorer(QMainWindow):
         menu=getattr(self,'favorite_picker_menu',None)
         if menu is not None:menu.close()
         viewer=getattr(self,'viewer',None)
-        if viewer is not None and viewer.isVisible():viewer.close()
+        if viewer is not None:
+            try:
+                if viewer.isVisible():viewer.close()
+            except RuntimeError:
+                logger.debug('The image viewer was already deleted during application shutdown')
+            self.viewer=None
         if hasattr(self,'grid'):self.grid.shutdown_workers()
         scan_jobs=list(getattr(self,'scan_jobs',[]))
         for job in scan_jobs:
@@ -2421,6 +2658,7 @@ class Explorer(QMainWindow):
         for job in scan_jobs:
             if job.isRunning():job.wait(250)
         VIEWER_IMAGE_POOL.shutdown(wait=False,cancel_futures=True)
+        THUMB_CACHE_CLEANUP_POOL.shutdown(wait=False,cancel_futures=True)
         if self.isFullScreen(): self.window_mode='fullscreen'
         elif self.isMaximized(): self.window_mode='maximized'
         else: self.window_mode='normal'
@@ -2441,7 +2679,7 @@ class Explorer(QMainWindow):
             if title=='VIEW':
                 m.addAction('Vertical grid',lambda checked=False:self.set_mode('vertical'));m.addAction('Horizontal rows',lambda checked=False:self.set_mode('horizontal'));m.addSeparator()
                 m.addAction('Thumbnail hover settings…',self.configure_hover_details);m.addAction('Slideshow timer…',self.configure_slideshow);m.addAction('Auto-hide panels…',self.configure_auto_hide);m.addAction('Right-side buttons…',self.configure_right_controls)
-                m.addAction('Manage personal orders…',self.manage_personal_orders)
+                m.addAction('Manage personal orders…',self.manage_personal_orders);m.addAction('Automatically refresh folder pages…',self.configure_folder_auto_refresh);m.addAction('Keep folder thumbnails…',self.manage_pinned_folders)
             if title=='PERFORMANCE':
                 recursive_action=m.addAction('Recursive search in subfolders');recursive_action.setCheckable(True);recursive_action.setChecked(self.recursive_search_enabled);recursive_action.toggled.connect(self.set_recursive_search_enabled)
                 m.addSeparator()
@@ -2451,9 +2689,10 @@ class Explorer(QMainWindow):
                 self.disk_thumbnail_cache_limit_action=m.addAction(f'On-disk thumbnail cache limit… ({self.disk_thumbnail_cache_limit_mib} MiB)');self.disk_thumbnail_cache_limit_action.triggered.connect(self.configure_disk_thumbnail_cache_limit)
                 m.addAction('Thumbnail cache location…',self.configure_thumbnail_cache_location)
                 self.log_storage_action=m.addAction(f'Maximum log storage… ({self.log_storage_mib} MiB)');self.log_storage_action.triggered.connect(self.configure_log_storage_limit)
-                m.addAction('Keep folder thumbnails…',self.manage_pinned_folders)
             if title=='TOOLS':m.addAction('Set custom folder thumbnail…',self.set_custom);m.addSeparator();m.addAction('Scroll behavior…',self.configure_scroll_behavior);m.addSeparator();m.addAction('Set startup folder…',self.set_startup);m.addAction('Use last folder on startup',self.clear_startup);m.addSeparator();m.addAction('Reverse image search…',self.choose_search_provider);m.addAction('Google Lens text query…',self.configure_google_lens_query);m.addAction('Set SauceNAO API key…',self.set_saucenao_api_key)
-            if title=='HELP':m.addAction('Keyboard and mouse controls…',self.show_controls_help)
+            if title=='HELP':
+                self.scroll_test_logging_action=m.addAction('Scroll test logging');self.scroll_test_logging_action.setCheckable(True);self.scroll_test_logging_action.setChecked(self.scroll_test_logging_enabled);self.scroll_test_logging_action.setToolTip('Write detailed scroll timing diagnostics to the application log');self.scroll_test_logging_action.toggled.connect(self.set_scroll_test_logging_enabled)
+                m.addAction('Keyboard and mouse controls…',self.show_controls_help)
         top=QFrame();top.setObjectName('top');top_layout=QVBoxLayout(top);top_layout.setContentsMargins(0,0,0,0);top_layout.setSpacing(0);top_layout.addWidget(mb);controls=QWidget(top);tl=QHBoxLayout(controls);tl.setContentsMargins(12,5,12,7);tl.setSpacing(7);top_layout.addWidget(controls)
         for s,t,f in [('☰','File tree',self.toggle_file_tree),('⌂','Back',self.back),('↑','Up',self.up),('⟳','Refresh',self.refresh_current_view)]:
             button=self.addbtn(tl,s,t,f)
@@ -2571,6 +2810,9 @@ class Explorer(QMainWindow):
         self.favorite_organize_overlay.show()
         self.selection_clear_overlay.show();self.selection_all_overlay.show();self.selection_undo_overlay.show()
         for widget in self.right_control_widgets():widget.raise_()
+    def search_has_focus(self):
+        search=getattr(self,'search',None);focus=QApplication.focusWidget()
+        return search is not None and (focus is search or (focus is not None and search.isAncestorOf(focus)))
     def toggle_search_navigation_focus(self):
         if QApplication.focusWidget() is self.search:
             self.grid.setFocus()
@@ -2582,7 +2824,8 @@ class Explorer(QMainWindow):
             self.main_hide_timer.stop();self.set_main_panel_visible(True)
         else:self.set_main_panel_visible(True)
         self.search.setFocus(Qt.ShortcutFocusReason);self.search.selectAll()
-    def viewer_closed(self):
+    def viewer_closed(self,viewer=None):
+        if viewer is None or getattr(self,'viewer',None) is viewer:self.viewer=None
         if self._closing:return
         if not self.auto_hide_tree and getattr(self,'tree_was_visible_before_viewer',False) and hasattr(self,'tree_dock'):self.tree_dock.show();self.refresh_file_tree()
         self.tree_was_visible_before_viewer=False
@@ -2635,6 +2878,7 @@ class Explorer(QMainWindow):
                     entries=[];total=0
                     with os.scandir(cache_dir) as items:
                         for entry in items:
+                            if self._closing:return
                             # Only remove files created by _persistent_folder_thumb_path.
                             # Cache location is user-selectable and may contain personal photos.
                             if not re.fullmatch(r'[0-9a-f]{40}\.jpg',entry.name,re.IGNORECASE):continue
@@ -2644,6 +2888,7 @@ class Explorer(QMainWindow):
                             except OSError:continue
                     if total<=limit_bytes:return
                     for _,size,path in sorted(entries):
+                        if self._closing:return
                         try:path.unlink(missing_ok=True);total-=size
                         except OSError:logger.warning('Could not remove cached thumbnail %s',path,exc_info=True)
                         if total<=limit_bytes:break
@@ -4361,11 +4606,11 @@ const out=document.createElement('input');out.type='hidden';out.name='output_typ
 <h2>Favorites and Farview</h2>
 <ul><li>The Favorites button opens Favorites; from a group or subfolder it returns to the Favorites root, and from the root it exits Favorites. Use the plus on a thumbnail to add it to Favorites or choose a group.</li><li>In Favorites, Delete removes selected entries. Double-click a group name to rename it. Groups stay at the top of the Favorites list.</li><li>Farview creates a tab that lines up images/files found in subfolders. It can be created from a folder or selection, and multiple Farview tabs can use different sorting. The Personal order sort uses a saved custom sequence when one exists.</li><li>Use Manage personal orders to search, sort, or remove saved sequences. Excluded paths are listed in the personal-order settings.</li></ul>
 <h2>Sorting and search</h2>
-<ul><li>Keys 1–6 select Name, Last modified, Last created, Type, Size, and Random sorting. The direction indicator switches ascending and descending. Personal order applies a custom sequence for the current folder or view.</li><li>Use the search field to filter items. Recursive search can be enabled in Performance. The clear button empties the search. Tools → Scroll behavior sets rows per wheel notch (including fractional rows) and optional momentum.</li></ul>
+<ul><li>Keys 1–6 select Name, Last modified, Last created, Type, Size, and Random sorting; 7 selects Personal order. The direction indicator switches ascending and descending. Personal order applies a custom sequence for the current folder or view.</li><li>Use the search field to filter items. Recursive search can be enabled in Performance. The clear button empties the search. Tools → Scroll behavior sets rows per wheel notch (including fractional rows) and optional momentum.</li></ul>
 <h2>Image viewer</h2>
 <ul><li>Left / right arrows or Q / E show the previous / next image. Holding a navigation key accelerates. Click the left or right edge to change images.</li><li>Right-click, Escape, or Up closes the viewer. Double-click toggles zoom. The wheel zooms at the pointer; drag to pan.</li><li>R rotates clockwise; F flips horizontally; G fits the image; H toggles slideshow; minus / equals zoom out/in; WASD pans. Delete sends the current image to the Recycle Bin.</li><li>Use the bottom controls for rotate, flip, fit, side-by-side pages, and slideshow. Hover the top area for image details.</li></ul>
 <h2>Thumbnails and panels</h2>
-<ul><li>Hover a thumbnail for size/date details and its Favorites control. Hover the right edge for selection and group controls.</li><li>When auto-hide is enabled, move to the top edge for the main panel or the left edge for File Tree. The tree remembers its open paths and selected location; use its × button to close it.</li><li>Performance settings include recursive search, thumbnail cache controls, and other resource limits. View settings control thumbnail details and panel auto-hide behavior.</li></ul>''')
+<ul><li>Hover a thumbnail for size/date details and its Favorites control. Hover the right edge for selection and group controls.</li><li>When auto-hide is enabled, move to the top edge for the main panel or the left edge for File Tree. The tree remembers its open paths and selected location; use its × button to close it.</li><li>Performance settings include recursive search, thumbnail cache controls, and other resource limits. View settings control thumbnail details, panel auto-hide, and automatic folder refresh. Scroll test logging can be toggled from Help when diagnostic timings are needed.</li></ul>''')
         content.setWordWrap(True);content.setTextFormat(Qt.RichText);content.setMargin(14)
         scroll=QScrollArea(dlg);scroll.setWidgetResizable(True);scroll.setWidget(content);layout.addWidget(scroll)
         buttons=QDialogButtonBox(QDialogButtonBox.Close);buttons.rejected.connect(dlg.reject);layout.addWidget(buttons);dlg.exec()
