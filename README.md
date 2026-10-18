@@ -80,7 +80,7 @@ https://github.com/user-attachments/assets/0b690a1b-efca-49df-a0c4-f26084e79414
 
 Visualization options:
 
-<img width="173" height="239" alt="image" src="https://github.com/user-attachments/assets/9f62748b-d4cf-4bbf-9f0c-00490ba12f28" />
+<img width="213" height="297" alt="image" src="https://github.com/user-attachments/assets/13964156-fe03-46fa-94a6-1aeaa6566379" />
 
 ## Controls:
 
