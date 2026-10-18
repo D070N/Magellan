@@ -14,9 +14,9 @@ Magellan is a Windows desktop file and media browser built with Python and Qt. T
 
 - Image search mode:
 
-<img width="1919" height="333" alt="image" src="https://github.com/user-attachments/assets/393443c1-2faf-4c17-aee7-c199c75bf515" />
+<img width="421" height="295" alt="image" src="https://github.com/user-attachments/assets/795accee-b1c3-4096-b9b7-213b94993340" /> <img width="679" height="698" alt="image" src="https://github.com/user-attachments/assets/25226686-339f-444b-8d5f-a8b954b7fadb" />
 
-If you are like me and always need to find more about a work of art or simply find the artist behind it, with the press of a button, you can send an image to Google Lens or SauceNAO. And the result of your search will appear in your browser, no hassle! You can also input your SauceNAO API key from your free account to increase your search usage.
+If you are like me and always need to find more about a work of art or simply find the artist behind it, with the press of a button, you can send an image to Google Lens or SauceNAO. The result of your search will appear directly in your browser, no hassle! You can input your SauceNAO API key from your free account to increase your search usage. There is also an option for the Google image search to attach a text query to the image, increasing the possibilities for different types of image search.
 
 - Group image visualization system. "Farview" mode creates a continuous list of images and files for quick visualization. Now you won't have to suffer with hundreds of single-image folders like I once did, because Farview takes all of those pictures and files and lists them as if they were from the same folder:
 
