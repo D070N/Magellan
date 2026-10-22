@@ -20,7 +20,7 @@ If you are like me and always need to find more about a work of art or simply fi
 
 - Group image visualization system. "Farview" mode creates a continuous list of images and files for quick visualization. Now you won't have to suffer with hundreds of single-image folders like I once did, because Farview takes all of those pictures and files and lists them as if they were from the same folder:
 
-https://github.com/user-attachments/assets/d7a6019e-b3c0-4ef0-8169-747d85d465b0
+https://github.com/user-attachments/assets/162a1aaf-095c-420c-8136-5afc90ac0b77
 
 As you can see you can easely select your desired folders to create a Farview, or you can simply press the button directely to create a Farview of the entire local page. 
 
@@ -56,7 +56,7 @@ Here you can create favorite groups, use the organization mode to drag files and
 
 - With the organization mode you can also set you own personal folder order and use it on Farview:
 
-https://github.com/user-attachments/assets/0b690a1b-efca-49df-a0c4-f26084e79414
+https://github.com/user-attachments/assets/9af24f4e-a542-4b3b-aa90-ac0dc786200e
 
 - Generate thumbnails asynchronously and cache them for smoother scrolling:
 
