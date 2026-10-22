@@ -24,7 +24,7 @@ https://github.com/user-attachments/assets/d7a6019e-b3c0-4ef0-8169-747d85d465b0
 
 As you can see you can easely select your desired folders to create a Farview, or you can simply press the button directely to create a Farview of the entire local page. 
 
-- Now with the folders perfectly ordered, you can make use of our local image viewer to swipe the list you just created:
+- Now with the folders perfectly ordered, you can make use of our local image viewer to swipe the list you just created: 
 
 <img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/d48f111a-0e87-4ea1-8fbe-777fa3156347" />
 
