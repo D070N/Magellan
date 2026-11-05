@@ -4,7 +4,7 @@ A Windows file and media browser built with Python and Qt, with a thumbnail-firs
 
 <img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/361435ba-9a95-465d-b106-9a39b50bc5ed" />
 
-# Suport the project
+## Suport the project
 
 Everything in here is completely free. There are no ads, monthly subscriptions, or paywalls! So if you feel generous and you like the app, you can [support via PayPal](https://www.paypal.com/donate/?business=LL62UHZCBYWS2&no_recurring=0&item_name=Thank+you+%28%24o%24%29&currency_code=BRL)
 
