@@ -1,11 +1,11 @@
 # Changelog
 
-## Unreleased
+## 2026-11-04
 
 - Remove repository test and audit artifacts, retaining application source and user-facing documentation.
 - Count rapid double-clicks on viewer side-navigation controls as a second swipe, without triggering image zoom or duplicating the release action.
 
-## Update — 2026-11-04
+## 2026-11-04
 
 This update includes the accumulated browser, viewer and performance work since the previous published source update. Historical entries below retain implementation details and dates.
 
@@ -44,80 +44,53 @@ This update includes the accumulated browser, viewer and performance work since 
 - Add archive image-search support, safer decoder selection, file-operation regression tests and GPU appearance/fallback/geometry checks. Update dependencies including the tested Pillow 13 migration. Dependency checks are point-in-time evidence, not a guarantee about native libraries or every machine.
 - Evaluate and reject experiments without reliable gains rather than retaining complexity: direct BGRA uploads, extra snapshot caching and several thumbnail scheduling/rendering variants. Detailed local profiling traces and personal test media are not published.
 
-## Unreleased — 2026-11-04
+## 2026-11-04
 
 - Preload nearby Farview archive/PDF pages in displayed order using one background request at a time, retaining a bounded viewer-session cache across archive swipes and clearing it on close.
-
 - Reuse the bounded GPU blur atlas and draw unscaled samples directly, reducing temporary image copies while preserving existing scaled-blur sampling and clearing stale pixels every frame.
-
 - Refresh appearance after dock-induced central-area resizes in both directions, and expose a non-mutating welcome preview in developer HELP.
-
 - Refresh appearance after docking layout transitions, add illustrated welcome/navigation help with restart after GPU opt-in, and add the current folder from the kept-thumbnails manager.
-
 - Group GPU and thumbnail cache controls into dedicated Performance windows with explanatory text; add a one-time GPU welcome choice and repaint compositor parents on geometry transitions.
-
 - Correct GPU composition texture orientation and main-panel crop alignment, preventing inverted thumbnail backgrounds and seams across panel sections. Add directional-pattern and tab-gap continuity checks.
-
 - Add optional experimental GPU panel composition, combining GPU-resident backplates with existing Qt controls, bounded shared textures, automatic regular-renderer recovery, and isolated viewer-only startup. Requires GPU thumbnail rendering and a full restart.
-
 - Include stretched File Tree backdrops in the existing experimental GPU blur batch, retaining current-frame sampling and CPU fallback.
-
 - Keep fullscreen window controls anchored and reachable when showing or hiding the docked File Tree resizes the central area.
-
 - Add an off-by-default experimental GPU panel-blur toggle, using bounded batched OpenGL samples, reusable textures and automatic regular-blur fallback. Menus and unsupported samples retain regular blur; shader output may look slightly different.
-
 - Reduce transparency blur processing with read-only pixel buffers, format-based opaque handling, and direct conversion to Qt-owned output, preserving exact backdrop pixels, clipping and update frequency.
 
-## Unreleased — 2026-11-03
+## 2026-11-03
 
 - Support reverse image search for selected images inside ZIP/RAR/CBZ/CBR and nested archives, preparing bounded uploads in a background worker for Google Lens and SauceNAO.
-
 - Keep deferred and cached thumbnail filename/icon layouts identical and repaint the complete vertical card when a preview arrives, preventing label shifts and stale text.
-
 - Coalesce settings updates and persist independent snapshots with one ordered background writer, skipping unchanged content and preserving atomic saves and final-save-before-backup ordering.
-
 - Start the first GPU scroll-motion tick before requesting its first frame, reducing stop/start latency while retaining subsequent swap-paced scheduling and glide behavior.
-
 - Add adaptive first-time thumbnail-card construction: keep cached cards immediate and defer costly new cards briefly, with automatic retries and low-memory safeguards.
-
 - Resolve and decode initial kept-folder previews in existing background workers, memoizing legacy cache paths without changing filenames or regenerating valid cached images.
-
 - Throttle repeated kept-thumbnail validation during painting, retaining periodic missing-cache detection with bounded bookkeeping.
-
 - Reuse directory-entry metadata for creation dates instead of issuing a separate filesystem lookup for every item during folder scans.
 
-## Unreleased — 2026-11-02
+## 2026-11-02
 
 - Restore first/last image swipe wrapping, preserving container skipping when continuous swipe is off.
-
 - Fix partial cross-drive move cleanup that could delete a completed recovery copy.
 - Reject unsafe Windows archive names and restrict Pillow loading to the intended JPEG XL decoder.
 - Remove confirmed unused code, add file-safety regression tests and update dependencies and improve release safety.
-
 - Avoid full-page selection-order scans and repeated unchanged-membership/counter work during drag selection.
 - Defer and chunk uncached selection-size requests until release; pause queued size scans during gestures.
 - Verify selection inversion, persistence, undo, Shift-click and auto-scroll.
-
 - Tested adaptive thumbnail worker limits and progressive JPEG folder previews separately and together. Neither showed a reliable overall improvement, so both experiments were reverted.
-
 - Prepare ordinary thumbnail pixel formats in existing decoder workers, avoiding display-thread format conversion without changing rendered pixels or high-bit-depth handling.
 - Tested stricter promotion budgets and full-card background preparation; neither demonstrated a reliable end-to-end benefit, so those experiments were removed and existing scheduling retained.
-
 - Use the standard yellow Main Panel accent when no custom color is selected.
 - Validate ordinary, smooth and uncached-folder GPU scrolling against the previous transparency readback path; no sustained regression found in the measured scenarios. Coalesce redundant refreshes to display cadence, with a lower refresh budget during active thumbnail loading.
-
 - Update transparency from displayed thumbnail-card pixels on each changed frame, removing delayed GPU framebuffer captures and duplicate card rendering.
-
 - Refresh visible transparent backdrops during scrolling without a trailing debounce; adapt capture frequency to its measured cost.
 - Restore docked button/tab transparency cutouts and fill File Tree effects to the bottom.
 - Refresh appearance immediately on hide-mode changes and move detached tabs below a revealed main panel.
 - Reduce broad background-blur processing cost without reducing text, icon or thumbnail resolution.
-
 - Keep appearance backgrounds behind controls when auto-hide is off, including resize and visibility transitions; restore File Tree content stacking after docking.
-
 - Hide scroll diagnostics from normal HELP; launch with `--developer` to access them.
 - Lock File Tree width and title dragging, refine appearance previews, and refresh the grouped controls guide.
-
 - Merged the GPU rendering test into the main application. GPU thumbnail rendering remains optional under PERFORMANCE, with standard rendering available as the default for new profiles.
 - Added desktop-composited fullscreen for GPU rendering, preserving the native window and OpenGL context across fullscreen and minimize/restore transitions.
 - Improved top and left edge detection for hidden panels, including native borders and zero-millisecond hide timers.
@@ -126,7 +99,7 @@ This update includes the accumulated browser, viewer and performance work since 
 - Made settings loading explicitly UTF-8 compatible, including BOM-prefixed files, while preserving protection against overwriting unreadable settings.
 - Removed the separate GPU test executable and filename-dependent preference override from the main build.
 
-## Unreleased — 2026-10-18
+## 2026-10-18
 
 - Added a configurable automatic folder refresh in **View**. It scans at low priority, defers applying results while the user is scrolling or selecting, and preserves the current navigation state.
 - Added scroll diagnostic logging, later restricted to developer-mode **Help**. Pressing `7` now selects Personal order.
@@ -134,7 +107,7 @@ This update includes the accumulated browser, viewer and performance work since 
 - Improved image-viewer preloading and moved file-size reads off the UI thread; retained original file metadata in the viewer cache.
 - Made viewer shutdown cleanup more defensive to reduce lingering image locks and close-time errors.
 
-## Unreleased — 2026-10-15
+## 2026-10-15
 
 - Organization mode now works in regular folders, Farview, and Favorites.
 - Added the Personal order sorting button.
@@ -151,7 +124,7 @@ This update includes the accumulated browser, viewer and performance work since 
 - Updated HELP to match the new commands and behavior.
 - Many minor fixes.
 
-## Unreleased — 2026-10-12
+## 2026-10-12
 
 - Improved folder-size sorting responsiveness by reusing cached sizes, prioritizing visible folders, and batching resorting until background size updates finish.
 - Prevented repeated thumbnail refreshes during size calculation, eliminating the tooltip blinking that occurred after scrolling stopped.
@@ -160,7 +133,7 @@ This update includes the accumulated browser, viewer and performance work since 
 - Limited grid repainting to rows intersecting the invalidated area.
 - Kept tab context menus reachable in auto-hide mode, closed them when the pointer leaves, and restored Ctrl-based tab range selection.
 
-## Unreleased — 2026-10-11
+## 2026-10-11
 
 - Kept favorite groups at the top of Favorites across sorting modes.
 - Enabled holding Ctrl to enter Favorites organization mode; dragging a selected item into a group now assigns the full selection.
