@@ -30,7 +30,7 @@ https://github.com/user-attachments/assets/476d5654-167f-419d-ba60-62a8b123a1a6
 
 Supported image extensions include JPEG/JFIF, PNG, WebP, GIF, BMP, TIFF, AVIF, HEIC/HEIF, JPEG XL and ICO. Decoding depends on the available Qt/Pillow codecs; damaged files and unsupported variants may fail. Very large images are decoded at bounded resolution while original dimensions remain available in the details.
 
-Reverse image search supports Google Lens and SauceNAO, including supported images inside archives. These actions send images to the chosen external service; they are separate from local browsing.
+- Reverse image search supports Google Lens and SauceNAO, including supported images inside archives. These actions send images to the chosen external service; they are separate from local browsing.
 
 <img width="421" height="295" alt="Image search example" src="https://github.com/user-attachments/assets/795accee-b1c3-4096-b9b7-213b94993340" />
 <img width="679" height="698" alt="Image search results example" src="https://github.com/user-attachments/assets/25226686-339f-444b-8d5f-a8b954b7fadb" />
