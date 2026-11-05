@@ -4020,7 +4020,8 @@ class MediaCanvas(QWidget):
             # Qt delivers a double-click event instead of the second press.
             # Treat it as another button activation, then consume its release.
             self.suppress_control_release=True
-            if pos.y()>=self.height()-72 and any(r.contains(pos) for r in self.bottom_buttons()):self.pending_click=pos;self.dispatch_click()
+            if (pos.y()>=self.height()-72 and any(r.contains(pos) for r in self.bottom_buttons())) or (not self.viewer.compare_enabled and not self.page_counter_rect().contains(pos) and (pos.x()<80 or pos.x()>self.width()-80)):
+                self.pending_click=pos;self.dispatch_click()
             return
         if self.viewer.compare_enabled:
             key=getattr(self.viewer,'compare_active_key',None)

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Remove repository test and audit artifacts, retaining application source and user-facing documentation.
+- Count rapid double-clicks on viewer side-navigation controls as a second swipe, without triggering image zoom or duplicating the release action.
+
 ## Update — 2026-11-04
 
 This update includes the accumulated browser, viewer and performance work since the previous published source update. Historical entries below retain implementation details and dates.
@@ -87,13 +92,13 @@ This update includes the accumulated browser, viewer and performance work since 
 
 - Fix partial cross-drive move cleanup that could delete a completed recovery copy.
 - Reject unsafe Windows archive names and restrict Pillow loading to the intended JPEG XL decoder.
-- Remove confirmed unused code, add file-safety regression tests and document the release audit and dependency findings in RELEASE_AUDIT.md.
+- Remove confirmed unused code, add file-safety regression tests and update dependencies and improve release safety.
 
 - Avoid full-page selection-order scans and repeated unchanged-membership/counter work during drag selection.
 - Defer and chunk uncached selection-size requests until release; pause queued size scans during gestures.
-- Verify selection inversion, persistence, undo, Shift-click and auto-scroll; record measurements in SELECTION_PERFORMANCE_REVIEW.md.
+- Verify selection inversion, persistence, undo, Shift-click and auto-scroll.
 
-- Tested adaptive thumbnail worker limits and progressive JPEG folder previews separately and together. Neither showed a reliable overall improvement, so both experiments were reverted; detailed local findings are in THUMBNAIL_PERFORMANCE_REVIEW.md.
+- Tested adaptive thumbnail worker limits and progressive JPEG folder previews separately and together. Neither showed a reliable overall improvement, so both experiments were reverted.
 
 - Prepare ordinary thumbnail pixel formats in existing decoder workers, avoiding display-thread format conversion without changing rendered pixels or high-bit-depth handling.
 - Tested stricter promotion budgets and full-card background preparation; neither demonstrated a reliable end-to-end benefit, so those experiments were removed and existing scheduling retained.

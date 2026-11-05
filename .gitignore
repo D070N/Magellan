@@ -18,7 +18,7 @@ __pycache__/
 .venv/
 venv/
 
-# Local audit/build staging outputs.
+# Local build staging outputs.
 /MediaExplorer/build_stage/
 /MediaExplorer/dist_stage/
 /MediaExplorer/build_local.log
