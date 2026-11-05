@@ -1,154 +1,105 @@
-# Suport the project
-
-Everything in here is completely free. There are no ads, monthly subscriptions, or paywalls! So if you feel generous and you like the app, you can [support via PayPal](https://www.paypal.com/donate/?business=LL62UHZCBYWS2&no_recurring=0&item_name=Thank+you+%28%24o%24%29&currency_code=BRL)
-
 # Magellan
 
-Magellan is a Windows desktop file and media browser built with Python and Qt. The application source and Windows build files are in [`MediaExplorer/`](MediaExplorer/); the root icon and `Alternative Icons/` assets are required by the app and its executable build.
+A Windows file and media browser built with Python and Qt, with a thumbnail-first interface, persistent tabs, an image/comic viewer, and customizable panels.
 
-## Features
+## Browse and organize
 
-- Browse folders and media while looking at thumbnails with adjustable size, tabs that persist even after closing the app, natural sorting, unobtrusive and configurable tooltips, and panels:
+- Browse folders, ZIP/RAR archives and supported nested archives. Generate thumbnails for images, documents, comics and supported videos.
+- Keep tabs across restarts; drag to reorder, scroll through crowded tabs, and color tab outlines. Each location remembers its sorting and personal order.
+- Use **Farview** to flatten selected folders, files and supported archive/document pages into one ordered collection. The viewer follows that collection across containers.
+- Organize Favorites into groups, including references to files and archive members. Select across folders for batch favorites commands and Farview creation.
+- Hold **Ctrl** for organization mode: drag to reorder thumbnails or move selected items into folders. Manage saved personal orders from **VIEW**.
+- **Alt+click** reveals a thumbnail item in its containing Explorer location.
+- Use the File Tree to navigate drives and favorite locations. It remembers expanded paths and scroll position; large directories load in the background.
+- Search filenames, optionally including subfolders. Optional automatic folder refresh updates pages while preserving navigation and deferring disruptive work during interaction.
 
-<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/321cb287-55af-4af9-a0a2-52f9fd4a5853" />
+## View images, comics and PDFs
 
-- Image search mode:
+- Open supported images, animated GIF/WebP, ICO, PDFs and CBZ/CBR comics. ZIP/RAR contents can be browsed as folders.
+- Cycle through four layouts: single image, double image, vertical reader and horizontal reader. Reader pages load on demand; per-file layout, zoom and page position are remembered within the session.
+- Zoom, pan, rotate, flip, compare two images with a wipe slider, or start a slideshow. Hover near the edges to reveal viewer controls and metadata.
+- Search text PDFs, navigate matches and see result markers on the scrollbar.
+- Jump to an image/page with the editable position counter. Optional continuous swipe includes supported containers; Farview follows its displayed order.
+- Nearby archive/PDF pages in Farview preload in the background and remain in a bounded viewer-session cache for faster swiping.
+- Explorer can open supported files directly in the lightweight viewer. **TOOLS** manages default-viewer registration and the optional **Open in Magellan** context command, which opens a location in the browser.
 
-<img width="1919" height="333" alt="image" src="https://github.com/user-attachments/assets/393443c1-2faf-4c17-aee7-c199c75bf515" />
+Supported image extensions include JPEG/JFIF, PNG, WebP, GIF, BMP, TIFF, AVIF, HEIC/HEIF, JPEG XL and ICO. Decoding depends on the available Qt/Pillow codecs; damaged files and unsupported variants may fail. Very large images are decoded at bounded resolution while original dimensions remain available in the details.
 
-If you are like me and always need to find more about a work of art or simply find the artist behind it, with the press of a button, you can send an image to Google Lens or SauceNAO. And the result of your search will appear in your browser, no hassle! You can also input your SauceNAO API key from your free account to increase your search usage.
+## Selection and file actions
 
-- Group image visualization system. "Farview" mode creates a continuous list of images and files for quick visualization. Now you won't have to suffer with hundreds of single-image folders like I once did, because Farview takes all of those pictures and files and lists them as if they were from the same folder:
+- **Shift+click** toggles selection; **Shift+drag** draws an inverting selection rectangle with edge auto-scroll. Selections can persist across folder navigation.
+- **Ctrl+A** toggles selection of the current page; **Space** or a double-click on empty background clears selection. **Ctrl+S** restores the last deselection.
+- **Ctrl+C / Ctrl+X / Ctrl+V** copy, cut and paste. Copying supported archive members extracts the chosen files.
+- **Ctrl+E** opens extraction confirmation; operation messages show progress and provide cancellation.
+- **Shift+Delete** sends selected filesystem items to the Recycle Bin. **Delete** removes selected Favorites references when browsing Favorites; in the viewer it trashes the current image.
+- **Ctrl+Z** undoes recent supported moves/deletions. **Shift+R** renames one selected item; the file-actions menu also offers inline renaming.
 
-https://github.com/user-attachments/assets/d7a6019e-b3c0-4ef0-8169-747d85d465b0
+See **HELP → Keyboard and mouse controls** for the complete guide and context-dependent behavior. File operations affect original files; Favorites and personal order are references/order metadata.
 
-As you can see you can easely select your desired folders to create a Farview, or you can simply press the button directely to create a Farview of the entire local page. 
+## Appearance and performance
 
-- Now with the folders perfectly ordered, you can make use of our local image viewer to swipe the list you just created:
+**VIEW → Appearance settings** controls backgrounds, gradients, accents, transparency and blur for the main panel, buttons, tabs, File Tree and context menus. **Hover and hide settings** groups panel, thumbnail, side-control and scrollbar behavior.
 
-<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/d48f111a-0e87-4ea1-8fbe-777fa3156347" />
+**PERFORMANCE → Cache settings** separates memory and disk thumbnail caches, their limits, cache location and kept-folder thumbnails. The disk-size limiter is off by default. Kept folders include their immediate children; add deeper locations separately. Memory and disk limits are independent.
 
-The main idea behind the image viewer is to completely remove any obstructions from your view and let you enjoy your pictures as they should be enjoyed. All of its buttons are hidden when they are not in use. When you need to know more about a picture or skip to the next, you can hover around and expose its info tooltip and buttons:
+**PERFORMANCE → GPU settings** explains three optional features:
 
-<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/d4f2791c-0079-4d16-aa9b-4c3340d50eab" />
+- **GPU thumbnail rendering:** supports swap-paced smooth scrolling and requests VSync. Requires a restart.
+- **GPU panel blur:** accelerates supported blur samples, with regular rendering for unsupported cases.
+- **GPU panel composition:** keeps panel backgrounds on the GPU beneath ordinary Qt controls. It can help with substantial visible blur, but may be slower with transparency alone. It does not accelerate dropdown/right-click menus. Requires GPU thumbnail rendering and a restart; takes precedence over standalone panel blur.
 
-The viewer also has a slideshow mode, double-page visualization, and flipping options. The Slidshow timer is configurable from the "VIEW" menu.
+The one-time welcome offers GPU thumbnail rendering plus smooth scrolling for the recommended scrolling experience, then restarts the app. Other GPU options stay independently configurable. They are experimental and fall back when unavailable; performance depends on theme, drivers and hardware. AMD/Intel performance has not been certified. **TOOLS → Scroll behavior** sets wheel distance and glide duration.
 
-- Selection mode:
+Thumbnail decoding, folder scans and file operations use background work, with bounded caches and progress feedback. These controls reduce stalls but do not guarantee hitch-free scrolling for every disk or file.
 
- <img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/dbb15b33-ec7d-46ed-84b7-0c6d9f6f6e56" />
+Optional reverse image search supports Google Lens and SauceNAO, including supported images inside archives. These actions send images to the chosen external service; they are separate from local browsing.
 
-As you can see, it's very similar to Windows selection mode, BUT, it persists even after changing folders, allowing you to not worry so much about losing a selection, speaking of which:
+## Demos
 
-<img width="265" height="227" alt="image" src="https://github.com/user-attachments/assets/77dc98f0-18d9-4c9f-af46-7cefe5b8af0e" />
+- [Farview selection and browsing](https://github.com/user-attachments/assets/25239582-d1f0-48bf-8d8b-0d49383d4699)
+- [Personal ordering](https://github.com/user-attachments/assets/5fcd3016-2674-4b24-9826-fcd5327a770c)
 
-If you lost a selection, you can simply "Ctrl+Z" or click the hidden side button above to reselect your last selection. No worries!
-
-- Magellan also offers you a favorite menu, which can be easily flooded by all of your 135 favorite pictures at once, using the selection feature:
-
-<img width="1919" height="1077" alt="image" src="https://github.com/user-attachments/assets/440f8662-7432-4e6a-82a4-3c6b3241c071" />
-
-The favorites menu, accessible by pressing the Star button on the main panel, has side buttons to help you navigate it:
-
-<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/ab8f2924-7bf5-4f17-8167-706267176da1" />
-
-Here you can create favorite groups, use the organization mode to drag files and folders to specific groups, and access your usual selection buttons.
-
-- With the organization mode you can also set you own personal folder order and use it on Farview:
-
-https://github.com/user-attachments/assets/0b690a1b-efca-49df-a0c4-f26084e79414
-
-- Generate thumbnails asynchronously and cache them for smoother scrolling:
-
-<img width="279" height="263" alt="image" src="https://github.com/user-attachments/assets/a1151486-5f18-4126-ac31-54793e689113" />
-
-- Search the current folder, with optional recursive search under **Performance**.
-
-- Browse folder trees with background loading and paged child lists:
-
-<img width="297" height="197" alt="image" src="https://github.com/user-attachments/assets/eda0e224-4124-420f-9035-614e62e82dc1" />
-  
-- View images, animated images, PDFs, and supported video formats; very large images are decoded at a bounded resolution while retaining their original dimensions in the viewer details. This means that BIG pictures are supported! I've tested up to 16K pictures.
-  
-- Save preferences and tabs locally. Application logs are bounded by the configured limit in **Performance**.
-
-<img width="255" height="167" alt="image" src="https://github.com/user-attachments/assets/a80c6cdb-67f9-49d0-841f-37925f0ec921" />
-
-- Useful tools:
-
-<img width="191" height="236" alt="image" src="https://github.com/user-attachments/assets/f32f30ab-42c9-4a76-9375-8491002976cd" />
-
-Visualization options:
-
-<img width="173" height="239" alt="image" src="https://github.com/user-attachments/assets/9f62748b-d4cf-4bbf-9f0c-00490ba12f28" />
-
-## Controls:
-
-I've made the controls thinking about optimal navigation efficiency. So, you might need to get used to it, but I promise it will be worth it. You can find all of them in the HELP menu along with their complete functionalities.
-
-- Navigation:
-
-Single left-click: Enters a folder and opens files.
-
-Right-click: Goes one page "up," like clicking the "Back" arrow in your browser or Windows Explorer.
-
-Middle Mouse-click: Opens the selected folder into a new tab and closes hovered tabs. 
-
-Shift+Left-click: Selection mode. Drag to define a selection area, and click to toggle the selection. 
-
-Alt+Left Click: Opens the containing folder of the targeted file.
-
-Ctrl+Left-click: Hold to enable organization mode.
-
-Ctrl+A: Selects and de-selects all files in the current page.
-
-Shift+Del: Sends selected files to trash.
-
-Ctrl+Z: Undoes the DE-selection or restores recently deleted files.
-
-Arows: Moves the selection highlight.
-
-Backspace: Goes back a folder.
-
-Enter: Enters a folder.
-
-1, 2, 3, 4, 5, 6: Toggles between sorting modes.
-
-- Image Viewer controls;
-
-Arrows: Swipes controls. The "up" arrow closes the viewer.
-
-W, A, S, D: Repositions image when zooming.
-
-Q and W: Previous and Next image.
-
-R: Rotate image
-
-F: Flip image
-
-H: Toggle slideshow.
-
-Del: Sends image to trash.
+<img width="421" height="295" alt="Image search example" src="https://github.com/user-attachments/assets/795accee-b1c3-4096-b9b7-213b94993340" />
+<img width="679" height="698" alt="Image search results example" src="https://github.com/user-attachments/assets/25226686-339f-444b-8d5f-a8b954b7fadb" />
 
 ## Run from source
 
-Install Python 3.10 or newer, then run these commands from `MediaExplorer`:
+Windows is the supported platform. Development builds are tested with Python 3.14; use a current Python version compatible with the dependencies in `MediaExplorer/requirements.txt`.
+
+From a Windows checkout:
 
 ```powershell
-py -m pip install -r requirements.txt
-py main.py
+cd MediaExplorer
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe main.py
 ```
 
-The application expects `MainIcon.ico` and `Alternative Icons/` in the repository root.
+Keep `Alternative Icons/` beside `MediaExplorer/`. The app/build uses `MainIconNew.ico`, `MainIconNewRAR.ico`, `MainIconNewRead.ico`, the welcome PNG and toolbar PNGs from that directory. The old root `MainIcon.ico` is no longer required.
 
 ## Build on Windows
 
-Run `MediaExplorer\build_windows.bat` from a Windows checkout. It installs the Python dependencies and PyInstaller, then writes `MediaExplorer\dist\Magellan.exe`.
+Run `MediaExplorer\build_windows.bat`. It installs dependencies and PyInstaller, builds in staging, and publishes `MediaExplorer\dist\Magellan.exe` alongside its `_internal` runtime. **Distribute the entire `dist` folder, not just the EXE.** Existing settings and the thumbnail-cache directory are separate from the bundled runtime.
 
-## Local settings and privacy
+Build outputs, virtual environments, recordings, caches and `Examples/` are excluded from Git. Executable packages belong in GitHub Releases rather than source commits. A clean-machine build/distribution check is still recommended before publishing binaries.
 
-Settings and logs are stored in the per-user application-data directory. The optional SauceNAO API key is stored in the local settings file and is not included in this repository.
+## Tests and developer mode
+
+From `MediaExplorer`, using the same environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s ..\tests -p "test_*.py"
+.\.venv\Scripts\python.exe main.py --developer
+```
+
+Developer mode exposes diagnostic controls and a non-mutating welcome preview in HELP. The separate `tests/ui_*.py` scripts exercise real Qt windows; GPU checks need a working graphics context and some need an unobstructed interactive desktop. Unit tests alone do not establish visual correctness or graphics-driver compatibility.
+
+## Settings, backups and privacy
+
+Settings are normally stored in `%APPDATA%\Magellan\settings.json`, with bounded logs in the `logs` subfolder. Changed full-browser sessions create up to ten settings backups in `Backups`, at least one minute apart. Viewer-only sessions do not create backups. Backups include Favorites references and groups, **not copies of the referenced files**.
+
+Thumbnails normally live in `thumbnail_cache` beside the application, unless a custom cache location is chosen. Logs can contain local paths; review them before sharing. Optional SauceNAO credentials are stored locally and are not required for offline browsing. Do not commit settings, keys, logs, caches or personal media.
 
 ## License
 
-Magellan is distributed under the MIT License. See [LICENSE](LICENSE).
+Magellan's source is licensed under [MIT](LICENSE). Third-party libraries, codecs and bundled native components retain their own licenses and redistribution terms; the project license does not replace them.

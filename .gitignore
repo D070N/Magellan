@@ -17,3 +17,13 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Local audit/build staging outputs.
+/MediaExplorer/build_stage/
+/MediaExplorer/dist_stage/
+/MediaExplorer/build_local.log
+
+/MediaExplorer/.venv-release/
+
+# Private recorded input and local profiling traces.
+/MediaExplorer/local_diagnostics/

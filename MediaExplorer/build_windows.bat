@@ -11,6 +11,12 @@ cd /d "%~dp0"
 
 echo [1/5] Checking Python...
 set "PYTHON_CMD="
+set "PYTHONPATH="
+
+if exist "%~dp0.venv-release\Scripts\python.exe" (
+    set "PYTHON_CMD=%~dp0.venv-release\Scripts\python.exe"
+    goto :python_found
+)
 
 where py >nul 2>&1
 if %errorlevel%==0 (
@@ -79,10 +85,11 @@ if errorlevel 1 (
 
 echo.
 echo [5/5] Building Magellan.exe...
-if exist build rmdir /s /q build
+if exist build_stage rmdir /s /q build_stage
+if exist dist_stage rmdir /s /q dist_stage
 if not exist dist mkdir dist
 
-"%PYTHON_CMD%" -m PyInstaller --noconfirm --clean Magellan.spec > build_log.txt 2>&1
+"%PYTHON_CMD%" -m PyInstaller --noconfirm --clean --distpath dist_stage --workpath build_stage Magellan.spec > build_log.txt 2>&1
 
 if errorlevel 1 (
     echo.
@@ -98,10 +105,30 @@ if errorlevel 1 (
     goto :failed
 )
 
-if not exist "dist\Magellan.exe" (
+if not exist "dist_stage\Magellan\Magellan.exe" (
     echo.
     echo ERROR: PyInstaller reported success but the EXE was not found.
     echo See build_log.txt for details.
+    goto :failed
+)
+
+echo Publishing the standard fast-start build to the existing dist folder...
+copy /Y "dist_stage\Magellan\Magellan.exe" "dist\Magellan.exe" >nul
+if errorlevel 1 goto :failed
+robocopy "dist_stage\Magellan\_internal" "dist\_internal" /MIR /COPY:DAT /R:1 /W:1 >nul
+if errorlevel 8 (
+    echo.
+    echo ERROR: Could not copy the Fast build into the main dist folder.
+    goto :failed
+)
+
+if exist "dist\MagellanFast" rmdir /s /q "dist\MagellanFast"
+if exist dist_stage rmdir /s /q dist_stage
+if exist build_stage rmdir /s /q build_stage
+
+if not exist "dist\Magellan.exe" (
+    echo.
+    echo ERROR: The main Magellan.exe was not published.
     goto :failed
 )
 
