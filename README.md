@@ -18,7 +18,7 @@ Everything in here is completely free. There are no ads, monthly subscriptions, 
 - Use the File Tree to navigate drives and favorite locations. It remembers expanded paths and scroll position; large directories load in the background.
 - Search filenames, optionally including subfolders. Optional automatic folder refresh updates pages while preserving navigation and deferring disruptive work during interaction.
 
-https://github.com/user-attachments/assets/5d176904-bd22-4ed9-b3c6-dee2a2405fb2
+https://github.com/user-attachments/assets/7cd137d4-1da7-4920-b7e9-4f49a891ef3b
 
 ## View images, comics and PDFs
 
@@ -30,7 +30,7 @@ https://github.com/user-attachments/assets/5d176904-bd22-4ed9-b3c6-dee2a2405fb2
 - Nearby archive/PDF pages in Farview preload in the background and remain in a bounded viewer-session cache for faster swiping.
 - Explorer can open supported files directly in the lightweight viewer. **TOOLS** manages default-viewer registration and the optional **Open in Magellan** context command, which opens a location in the browser.
 
-https://github.com/user-attachments/assets/476d5654-167f-419d-ba60-62a8b123a1a6
+https://github.com/user-attachments/assets/88c9f8d0-88b8-442d-9053-ae6573e3c589
 
 Supported image extensions include JPEG/JFIF, PNG, WebP, GIF, BMP, TIFF, AVIF, HEIC/HEIF, JPEG XL and ICO. Decoding depends on the available Qt/Pillow codecs; damaged files and unsupported variants may fail. Very large images are decoded at bounded resolution while original dimensions remain available in the details.
 
